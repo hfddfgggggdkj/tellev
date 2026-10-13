@@ -1,5 +1,7 @@
 package app.tellev.feature.creation
 
+import app.tellev.ui.dsh.Dsh
+
 import android.annotation.SuppressLint
 import android.graphics.BitmapFactory
 import android.net.Uri
@@ -16,7 +18,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -40,6 +41,7 @@ import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Badge
+import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Preview
@@ -47,6 +49,7 @@ import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Card
@@ -57,11 +60,12 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.ui.unit.sp
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -74,6 +78,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -86,13 +91,17 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import app.tellev.R
-import app.tellev.ui.AtmosphereIntro
 import app.tellev.core.i18n.S
 import app.tellev.core.i18n.UiStrings
+import app.tellev.core.provider.ImageProviderProfile
+import app.tellev.core.provider.ProviderCatalog
+import app.tellev.core.provider.ProviderConfigPersistence
 import app.tellev.util.UriUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -137,6 +146,9 @@ fun CreationHomeScreen(
     viewModel: CreationViewModel,
     onBack: () -> Unit,
     onOpenEditor: () -> Unit,
+    // 形参携带会话类型（与 creation/chat?kind= 路由参数同值）。默认回落只能去旧编辑器，
+    // 调用方必须显式接入路由，否则聊天式创建入口会被静默改道（TELLER-1-7 根因一）。
+    onOpenChatCreation: (String) -> Unit = { onOpenEditor() },
 ) {
     val state by viewModel.state.collectAsState()
     var pendingDelete by remember { mutableStateOf<CreationSessionSummary?>(null) }
@@ -151,7 +163,7 @@ fun CreationHomeScreen(
             },
             confirmButton = {
                 TextButton(onClick = { viewModel.deleteDraft(draft.id); pendingDelete = null }, enabled = !state.busy) {
-                    Text(stringResource(R.string.crs_delete), color = MaterialTheme.colorScheme.error)
+                    Text(stringResource(R.string.crs_delete), color = Dsh.errorPrimary)
                 }
             },
             dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text(stringResource(R.string.crs_cancel)) } },
@@ -165,14 +177,12 @@ fun CreationHomeScreen(
             contentPadding = PaddingValues(18.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            item(key = "creation_intro") {
-            AtmosphereIntro(
-                title = stringResource(R.string.ui_creation_intro),
-                subtitle = stringResource(R.string.ui_creation_intro_hint),
-                icon = Icons.Filled.Badge,
-            )
-            }
             item(key = "creation_start") {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            // 主路径：角色卡/世界书两张卡都直达聊天式创建；旧编辑器保留为
+            // 次级入口（聊天页 ⋮→手动编辑、草稿行点击）。
+            // 点击处先 start()：路由侧 LaunchedEffect 只在 current==null 或
+            // kind 不一致时才起会话，先起可避免误恢复此前的旧草稿。
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 CreationStartCard(
                     modifier = Modifier.weight(1f),
@@ -180,7 +190,7 @@ fun CreationHomeScreen(
                     title = stringResource(R.string.crs_new_character),
                     description = stringResource(R.string.crs_new_character_desc),
                     enabled = !state.busy,
-                    onClick = { viewModel.start(CreationKind.Character); onOpenEditor() },
+                    onClick = { viewModel.start(CreationKind.Character); onOpenChatCreation(CreationKind.Character.name) },
                 )
                 CreationStartCard(
                     modifier = Modifier.weight(1f),
@@ -188,41 +198,48 @@ fun CreationHomeScreen(
                     title = stringResource(R.string.crs_new_worldbook),
                     description = stringResource(R.string.crs_new_worldbook_desc),
                     enabled = !state.busy,
-                    onClick = { viewModel.start(CreationKind.WorldBook); onOpenEditor() },
+                    onClick = { viewModel.start(CreationKind.WorldBook); onOpenChatCreation(CreationKind.WorldBook.name) },
                 )
             }
             }
+            }
             item(key = "drafts_header") {
-                Text(stringResource(R.string.crs_drafts_title), style = MaterialTheme.typography.titleMedium)
+                Text(stringResource(R.string.crs_drafts_title), fontSize = 14.sp)
             }
                 items(state.sessions, key = CreationSessionSummary::id) { session ->
                     Surface(
-                        shape = RoundedCornerShape(14.dp),
-                        color = MaterialTheme.colorScheme.surface,
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                        shape = RoundedCornerShape(Dsh.RADIUS_MD.dp),
+                        color = Dsh.bgBase,
+                        border = BorderStroke(1.dp, Dsh.borderL3),
                         modifier = Modifier.fillMaxWidth(),
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Column(Modifier.weight(1f).clip(RoundedCornerShape(14.dp)).clickable(enabled = !state.busy) {
+                            // O5: the busy session's row stays clickable so the
+                            // Stop button remains reachable after leaving the
+                            // editor mid-generation; open() no-ops while busy,
+                            // and the editor shows the still-running session.
+                            Column(Modifier.weight(1f).clip(RoundedCornerShape(Dsh.RADIUS_MD.dp)).clickable(
+                                enabled = !state.busy || state.current?.id == session.id,
+                            ) {
                                 viewModel.open(session.id)
                                 onOpenEditor()
                             }.padding(14.dp)) {
                                 val sessionName = session.cardName.ifBlank { session.worldName.ifBlank {
                                     stringResource(if (session.kind == CreationKind.Character) R.string.crs_unnamed_character else R.string.crs_unnamed_worldbook)
                                 } }
-                                Text(sessionName, style = MaterialTheme.typography.titleSmall)
+                                Text(sessionName, fontSize = 13.sp)
                                 val kindLabel = stringResource(if (session.kind == CreationKind.Character) R.string.crs_kind_character else R.string.crs_kind_worldbook)
                                 Text(
                                     stringResource(R.string.crs_session_meta, kindLabel, session.turnsCount, session.loreCount),
-                                    style = MaterialTheme.typography.bodySmall,
+                                    fontSize = 12.sp,
                                 )
                                 if (session.sourceLength > 0) {
-                                    Text(stringResource(R.string.crs_source_extracted_short, session.sourceCursor, session.sourceLength), style = MaterialTheme.typography.bodySmall)
+                                    Text(stringResource(R.string.crs_source_extracted_short, session.sourceCursor, session.sourceLength), fontSize = 12.sp)
                                 }
                             }
                             IconButton(onClick = { pendingDelete = session }, enabled = !state.busy) {
                                 Icon(Icons.Outlined.Delete, contentDescription = stringResource(R.string.crs_delete),
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    tint = Dsh.textSecondary)
                             }
                         }
                     }
@@ -242,20 +259,22 @@ private fun CreationStartCard(
     onClick: () -> Unit,
 ) {
     Surface(
-        shape = RoundedCornerShape(22.dp),
-        color = MaterialTheme.colorScheme.primaryContainer,
-        modifier = modifier.clip(RoundedCornerShape(22.dp)).clickable(enabled = enabled, onClick = onClick),
+        // dsh 圆角体系（base.css 4/8/12/16/20/28）：入口大卡取 xl=20，
+        // 原 22 不在体系内。
+        shape = RoundedCornerShape(Dsh.RADIUS_XL.dp),
+        color = Dsh.hover,
+        modifier = modifier.clip(RoundedCornerShape(Dsh.RADIUS_XL.dp)).clickable(enabled = enabled, onClick = onClick),
     ) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Box(
                 Modifier.clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
+                    .background(Dsh.blue.copy(alpha = 0.12f))
                     .padding(8.dp),
             ) { icon() }
-            Text(title, style = MaterialTheme.typography.titleSmall,
-                color = MaterialTheme.colorScheme.onPrimaryContainer)
-            Text(description, style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f))
+            Text(title, fontSize = 13.sp,
+                color = Dsh.textPrimary)
+            Text(description, fontSize = 12.sp,
+                color = Dsh.textPrimary.copy(alpha = 0.8f))
         }
     }
 }
@@ -350,7 +369,11 @@ fun CreationEditorScreen(
         }
     }
     var tab by remember { mutableIntStateOf(0) }
-    LaunchedEffect(session?.id) { tab = 0 }
+    var showCoverDialog by remember { mutableStateOf(false) }
+    LaunchedEffect(session?.id) {
+        tab = 0
+        if (session?.kind == CreationKind.Character) viewModel.refreshCoverEngines()
+    }
     Scaffold(
         topBar = {
             TopAppBar(title = { Text(stringResource(if (session?.kind == CreationKind.WorldBook) R.string.crs_editor_title_worldbook else R.string.crs_editor_title_character)) },
@@ -373,8 +396,8 @@ fun CreationEditorScreen(
             Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
                 Text(
                     state.error ?: stringResource(R.string.crs_loading_draft),
-                    color = if (state.error != null) MaterialTheme.colorScheme.error
-                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (state.error != null) Dsh.errorPrimary
+                    else Dsh.textSecondary,
                     modifier = Modifier.padding(16.dp),
                 )
             }
@@ -386,16 +409,34 @@ fun CreationEditorScreen(
             when (tab) {
                 0 -> CreationConversation(session, state, viewModel)
                 1 -> CharacterDraftEditor(
-                    session.card, state.coverPreviewPng, viewModel, state.busy,
+                    session, state.coverPreviewPng, viewModel, state.busy,
+                    coverEngines = state.imageEngines,
+                    isGeneratingCover = state.isGeneratingCover,
                     onPickCover = { coverPicker.launch("image/*") },
                     onExportJson = { prepareExport(CharacterExportFormat.Json) },
                     onExportPng = { prepareExport(CharacterExportFormat.Png) },
+                    onGenerateCover = { showCoverDialog = true },
                 )
                 2 -> WorldDraftEditor(session, viewModel, state.busy, onExportJson = { prepareWorldBookExport() })
                 3 -> FrontendPreview(session.card, viewModel, state.busy)
                 4 -> AdvancedAssetsPanel(session, viewModel, state.busy)
             }
         }
+    }
+    if (showCoverDialog && session != null) {
+        CoverGenerationDialog(
+            engines = state.imageEngines,
+            profiles = state.imageProfiles,
+            initialPrompt = session.card.coverPrompt.ifBlank {
+                listOf(session.card.name, session.card.personality)
+                    .map(String::trim).filter(String::isNotBlank).joinToString(", ")
+            },
+            isGenerating = state.isGeneratingCover,
+            onGenerate = { prompt, negative, engineId ->
+                viewModel.generateCover(prompt, negative, engineId)
+            },
+            onDismiss = { showCoverDialog = false },
+        )
     }
 }
 
@@ -437,15 +478,15 @@ private fun CreationBottomNav(tab: Int, kind: CreationKind, busy: Boolean, onSel
 @Composable
 private fun CreationBanner(text: String, isError: Boolean) {
     Surface(
-        color = if (isError) MaterialTheme.colorScheme.errorContainer
-        else MaterialTheme.colorScheme.secondaryContainer,
+        color = if (isError) Dsh.errorPrimary
+        else Dsh.hover,
         shape = RoundedCornerShape(10.dp),
         modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
     ) {
         Text(
-            text, style = MaterialTheme.typography.bodySmall,
-            color = if (isError) MaterialTheme.colorScheme.onErrorContainer
-            else MaterialTheme.colorScheme.onSecondaryContainer,
+            text, fontSize = 12.sp,
+            color = if (isError) Dsh.bgBase
+            else Dsh.textPrimary,
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
         )
     }
@@ -455,7 +496,7 @@ private fun CreationBanner(text: String, isError: Boolean) {
 private fun CreationActivityPanel(state: CreationUiState, session: CreationSession, viewModel: CreationViewModel) {
     var showRawStream by remember(session.id, state.operationStartedAtMillis) { mutableStateOf(false) }
     var showFullStream by remember(session.id, state.operationStartedAtMillis) { mutableStateOf(false) }
-    var clockMillis by remember(state.operationStartedAtMillis) { mutableStateOf(System.currentTimeMillis()) }
+    var clockMillis by remember(state.operationStartedAtMillis) { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(state.busy, state.operationStartedAtMillis) {
         while (state.busy) {
             clockMillis = System.currentTimeMillis()
@@ -468,14 +509,14 @@ private fun CreationActivityPanel(state: CreationUiState, session: CreationSessi
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (state.busy) CircularProgressIndicator(modifier = Modifier.height(20.dp))
                     val progressTitle = stringResource(R.string.crs_progress_title)
-                    Text(state.operationLabel.ifBlank { progressTitle }, style = MaterialTheme.typography.titleSmall)
+                    Text(state.operationLabel.ifBlank { progressTitle }, fontSize = 13.sp)
                 }
                 if (state.busy) TextButton(onClick = viewModel::cancelGeneration) { Text(stringResource(R.string.crs_stop)) }
             }
-            Text(state.modelPhase, style = MaterialTheme.typography.bodySmall)
+            Text(state.modelPhase, fontSize = 12.sp)
             if (state.toolEvents.isNotEmpty()) {
                 Text(stringResource(R.string.crs_tool_events_title, state.toolEvents.size),
-                    style = MaterialTheme.typography.labelMedium)
+                    fontSize = 12.sp)
                 // Per-round grouped activity log: one line per call, in the same
                 // order the model issued them. Cap the log so a 32-round turn
                 // cannot grow the panel without bound.
@@ -489,67 +530,67 @@ private fun CreationActivityPanel(state: CreationUiState, session: CreationSessi
                         if (event.round != lastRound) {
                             lastRound = event.round
                             Text(stringResource(R.string.crs_tool_round, event.round),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                fontSize = 11.sp,
+                                color = Dsh.textSecondary)
                         }
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(if (event.ok) "✓" else "✗",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (event.ok) MaterialTheme.colorScheme.primary
-                                else MaterialTheme.colorScheme.error)
+                                fontSize = 12.sp,
+                                color = if (event.ok) Dsh.blue
+                                else Dsh.errorPrimary)
                             Text(
                                 "  #${event.index} ${event.name}" +
                                     if (event.detail.isNotBlank()) " — ${event.detail}" else "",
-                                style = MaterialTheme.typography.bodySmall,
+                                fontSize = 12.sp,
                             )
                         }
                     }
                 }
             }
             if (state.providerLabel.isNotBlank()) {
-                Text(stringResource(R.string.crs_provider_connected, state.providerLabel), style = MaterialTheme.typography.bodySmall)
+                Text(stringResource(R.string.crs_provider_connected, state.providerLabel), fontSize = 12.sp)
             }
             if (state.busy && state.operationStartedAtMillis > 0) {
                 val elapsedSeconds = ((clockMillis - state.operationStartedAtMillis).coerceAtLeast(0) / 1_000)
-                Text(stringResource(R.string.crs_task_elapsed, elapsedSeconds), style = MaterialTheme.typography.bodySmall)
+                Text(stringResource(R.string.crs_task_elapsed, elapsedSeconds), fontSize = 12.sp)
             }
             if (state.deltaCount > 0) {
                 val spanSeconds = ((state.lastDeltaMillis ?: 0L) - (state.firstDeltaMillis ?: 0L))
                     .coerceAtLeast(0) / 1_000
                 Text(stringResource(R.string.crs_delta_stats,
                     state.firstDeltaMillis.orZeroSeconds(), state.lastDeltaMillis.orZeroSeconds(), spanSeconds, state.deltaCount),
-                    style = MaterialTheme.typography.bodySmall)
+                    fontSize = 12.sp)
             } else if (state.busy && state.modelPhase.contains(UiStrings.get(S.creng_phase_waiting_model))) {
                 // modelPhase carries the engine's UiStrings-resolved text; compare against the same
                 // creng_phase_waiting_model resource instead of a hardcoded display string.
-                Text(stringResource(R.string.crs_waiting_first_chunk), style = MaterialTheme.typography.bodySmall)
+                Text(stringResource(R.string.crs_waiting_first_chunk), fontSize = 12.sp)
             } else if (!state.busy && state.modelElapsedMillis > 0 && state.liveOutput.isNotBlank()) {
                 Text(stringResource(R.string.crs_no_stream_fallback, state.modelElapsedMillis / 1_000),
-                    style = MaterialTheme.typography.bodySmall)
+                    fontSize = 12.sp)
             }
             if (session.sourceLength > 0) {
                 val fraction = session.sourceCursor.toFloat() / session.sourceLength
                 LinearProgressIndicator(progress = { fraction }, modifier = Modifier.fillMaxWidth())
                 Text(stringResource(R.string.crs_source_saved_pct, session.sourceCursor, session.sourceLength, (fraction * 100).toInt()),
-                    style = MaterialTheme.typography.bodySmall)
+                    fontSize = 12.sp)
             }
             if (state.extractionProgress.isNotBlank()) {
-                Text(state.extractionProgress, style = MaterialTheme.typography.bodySmall)
+                Text(state.extractionProgress, fontSize = 12.sp)
             }
             if (state.busy && state.liveAssistantMessage.isNotBlank()) {
-                Text(stringResource(R.string.crs_agent_replying), style = MaterialTheme.typography.labelMedium)
+                Text(stringResource(R.string.crs_agent_replying), fontSize = 12.sp)
                 Column(Modifier.heightIn(max = 180.dp).verticalScroll(rememberScrollState())) {
                     Text(state.liveAssistantMessage.takeLast(1_000))
                 }
             }
             if (state.liveReasoning.isNotBlank()) {
-                Text(stringResource(R.string.crs_reasoning_title), style = MaterialTheme.typography.labelMedium)
+                Text(stringResource(R.string.crs_reasoning_title), fontSize = 12.sp)
                 Column(Modifier.heightIn(max = 180.dp).verticalScroll(rememberScrollState())) {
                     SelectionContainer { Text(state.liveReasoning) }
                 }
             } else if (!state.busy && state.liveOutput.isNotBlank()) {
                 Text(stringResource(R.string.crs_no_reasoning),
-                    style = MaterialTheme.typography.bodySmall)
+                    fontSize = 12.sp)
             }
             if (state.liveOutput.isNotBlank()) {
                 TextButton(onClick = { showRawStream = !showRawStream }) {
@@ -567,14 +608,14 @@ private fun CreationActivityPanel(state: CreationUiState, session: CreationSessi
                 }
                 Column(Modifier.heightIn(max = 220.dp).verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(stringResource(R.string.crs_draft_raw_title), style = MaterialTheme.typography.labelMedium)
+                    Text(stringResource(R.string.crs_draft_raw_title), fontSize = 12.sp)
                     SelectionContainer {
                         Text(if (showFullStream) state.liveOutput else state.liveOutput.takeLast(limit))
                     }
-                    if (shortened) Text(stringResource(R.string.crs_stream_truncated, limit), style = MaterialTheme.typography.bodySmall)
+                    if (shortened) Text(stringResource(R.string.crs_stream_truncated, limit), fontSize = 12.sp)
                 }
             } else if (state.busy && state.liveReasoning.isBlank() && state.liveAssistantMessage.isBlank()) {
-                Text(stringResource(R.string.crs_waiting_provider_text), style = MaterialTheme.typography.bodySmall)
+                Text(stringResource(R.string.crs_waiting_provider_text), fontSize = 12.sp)
             }
         }
     }
@@ -600,7 +641,7 @@ private fun CreationConversation(session: CreationSession, state: CreationUiStat
             item {
                 Text(
                     stringResource(R.string.crs_conversation_intro),
-                    style = MaterialTheme.typography.bodyMedium,
+                    fontSize = 13.sp,
                 )
             }
             if (session.turns.isEmpty()) {
@@ -608,7 +649,11 @@ private fun CreationConversation(session: CreationSession, state: CreationUiStat
                     CreationBriefForm(session.kind, busy, viewModel::send)
                 }
             }
-            items(session.turns) { turn ->
+            itemsIndexed(
+                session.turns,
+                key = { index, _ -> "turn-$index" },
+                contentType = { _, _ -> "turn" },
+            ) { _, turn ->
                 val isUser = turn.role == "user"
                 // Chat-style bubbles: user right on primaryContainer, agent left
                 // on surfaceVariant, with selectable text for copy-paste.
@@ -619,22 +664,22 @@ private fun CreationConversation(session: CreationSession, state: CreationUiStat
                             .fillMaxWidth(0.85f)
                             .clip(RoundedCornerShape(12.dp))
                             .background(
-                                if (isUser) MaterialTheme.colorScheme.primaryContainer
-                                else MaterialTheme.colorScheme.surfaceVariant,
+                                if (isUser) Dsh.hover
+                                else Dsh.hover,
                             )
                             .padding(10.dp),
                         verticalArrangement = Arrangement.spacedBy(2.dp),
                     ) {
                         Text(
                             if (isUser) stringResource(R.string.crs_role_you) else stringResource(R.string.crs_role_agent),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.outline,
+                            fontSize = 11.sp,
+                            color = Dsh.borderL2,
                         )
                         SelectionContainer {
                             Text(
                                 turn.text,
-                                color = if (isUser) MaterialTheme.colorScheme.onPrimaryContainer
-                                else MaterialTheme.colorScheme.onSurface,
+                                color = if (isUser) Dsh.textPrimary
+                                else Dsh.textPrimary,
                             )
                         }
                     }
@@ -644,7 +689,7 @@ private fun CreationConversation(session: CreationSession, state: CreationUiStat
                 item(key = "creation-resume") {
                     if (session.partialTurnSaved) {
                         OutlinedButton(onClick = {
-                            viewModel.send("请从已保存的草稿继续完成上一轮未完成的工作；不要重复创建已经写入的条目。")
+                            viewModel.send(UiStrings.get(S.creng_quick_resume))
                         }) { Text(stringResource(R.string.crs_continue_incomplete)) }
                     } else {
                         OutlinedButton(onClick = viewModel::retry) {
@@ -666,7 +711,7 @@ private fun CreationConversation(session: CreationSession, state: CreationUiStat
             } else if (session.sourceLength > 0) {
                 item(key = "source-progress") {
                     Text(stringResource(R.string.crs_source_extracted_continue, session.sourceCursor, session.sourceLength),
-                        style = MaterialTheme.typography.bodySmall)
+                        fontSize = 12.sp)
                 }
             }
             state.pendingQuestion?.let { question ->
@@ -674,9 +719,9 @@ private fun CreationConversation(session: CreationSession, state: CreationUiStat
                     Card(Modifier.fillMaxWidth()) {
                         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             Text(stringResource(R.string.crs_agent_asking),
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.primary)
-                            Text(question.question, style = MaterialTheme.typography.bodyMedium)
+                                fontSize = 12.sp,
+                                color = Dsh.blue)
+                            Text(question.question, fontSize = 13.sp)
                             question.options.forEach { option ->
                                 OutlinedButton(
                                     onClick = { viewModel.answerAgentQuestion(option.label) },
@@ -686,8 +731,8 @@ private fun CreationConversation(session: CreationSession, state: CreationUiStat
                                         Text(option.label)
                                         if (option.description.isNotBlank()) {
                                             Text(option.description,
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                                fontSize = 12.sp,
+                                                color = Dsh.textSecondary)
                                         }
                                     }
                                 }
@@ -697,27 +742,40 @@ private fun CreationConversation(session: CreationSession, state: CreationUiStat
                 }
             }
         }
+        // Agent 提供的引导建议：点击只填入输入框，发送永远由用户按下。
+        if (!busy && state.suggestions.isNotEmpty()) {
+            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                state.suggestions.forEach { suggestion ->
+                    AssistChip(
+                        onClick = { input = suggestion },
+                        enabled = !busy,
+                        label = { Text(suggestion, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    )
+                }
+            }
+        }
         if (session.turns.isNotEmpty()) {
             Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                AssistChip(onClick = { viewModel.send("请继续引导，只问我当前最关键的 1 至 2 个问题，并先整理已有设定。") },
+                AssistChip(onClick = { viewModel.send(UiStrings.get(S.creng_quick_continue_guide)) },
                     enabled = !busy, label = { Text(stringResource(R.string.crs_btn_continue_guide)) })
-                AssistChip(onClick = { viewModel.send("这一部分交给你决定。请结合已确定设定写入草稿，并说明你的选择。") },
+                AssistChip(onClick = { viewModel.send(UiStrings.get(S.creng_quick_ai_decide)) },
                     enabled = !busy, label = { Text(stringResource(R.string.crs_btn_ai_decide)) })
-                AssistChip(onClick = { viewModel.send(if (session.kind == CreationKind.Character)
-                    "请根据目前已有信息立即完成可编辑的角色卡初稿和适用的世界书条目，缺口用合理设定补齐并标明待核对处。"
-                    else "请根据目前已有信息立即完成可编辑的世界书条目初稿，区分已确定事实与待核对设定。") },
+                AssistChip(onClick = { viewModel.send(UiStrings.get(if (session.kind == CreationKind.Character)
+                    S.creng_quick_draft_character else S.creng_quick_draft_worldbook)) },
                     enabled = !busy, label = { Text(stringResource(R.string.crs_btn_generate_draft)) })
                 if (session.kind == CreationKind.WorldBook) {
-                    AssistChip(onClick = { viewModel.send("请从现在起逐条与我讨论世界书条目。先提议一条，等我确认或修改后再写入草稿，然后讨论下一条。") },
+                    AssistChip(onClick = { viewModel.send(UiStrings.get(S.creng_quick_discuss_lore)) },
                         enabled = !busy, label = { Text(stringResource(R.string.crs_btn_discuss_one_by_one)) })
                 }
                 if (session.kind == CreationKind.Character) {
-                    AssistChip(onClick = { viewModel.send("请根据这张卡的设定，实际创建可运行的变量结构和动态状态栏。先检查已有脚本、变量与正则，再分模块写入草稿；不要只输出让玩家复制的提示词。每个模块写完说明作用和待验证点。") },
+                    AssistChip(onClick = { viewModel.send(UiStrings.get(S.creng_quick_status_bar)) },
                         enabled = !busy, label = { Text(stringResource(R.string.crs_btn_status_bar)) })
                 }
             }
         }
+        var optimizeOpen by remember { mutableStateOf(false) }
         Row(Modifier.fillMaxWidth().padding(top = 6.dp),
             verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedTextField(
@@ -725,6 +783,12 @@ private fun CreationConversation(session: CreationSession, state: CreationUiStat
                 label = { Text(stringResource(R.string.crs_input_label)) }, minLines = 1, maxLines = 6,
                 shape = RoundedCornerShape(24.dp),
             )
+            // 与聊天输入框一致：优化只改草稿，发送仍由用户按下发送键。
+            if (input.isNotBlank()) {
+                IconButton(onClick = { optimizeOpen = true }, enabled = !busy) {
+                    Icon(Icons.Filled.AutoFixHigh, contentDescription = stringResource(R.string.chat_optimize_title))
+                }
+            }
             FilledIconButton(
                 onClick = { viewModel.send(input); input = "" },
                 enabled = !busy && input.isNotBlank(),
@@ -732,6 +796,18 @@ private fun CreationConversation(session: CreationSession, state: CreationUiStat
             ) {
                 Icon(Icons.AutoMirrored.Filled.Send, contentDescription = stringResource(R.string.crs_send))
             }
+        }
+        if (optimizeOpen) {
+            app.tellev.ui.PromptOptimizationDialog(
+                providerLabel = null,
+                onRun = { options, onPreview, onDone -> viewModel.optimizeDraft(input, options, onPreview, onDone) },
+                onCancelRun = { viewModel.cancelPromptOptimization() },
+                onApply = { optimized ->
+                    input = optimized
+                    optimizeOpen = false
+                },
+                onDismiss = { optimizeOpen = false },
+            )
         }
     }
 }
@@ -749,8 +825,8 @@ private fun CreationBriefForm(kind: CreationKind, busy: Boolean, onStart: (Strin
     var loreOneByOne by remember(kind) { mutableStateOf(false) }
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(stringResource(R.string.crs_brief_title), style = MaterialTheme.typography.titleMedium)
-            Text(stringResource(R.string.crs_brief_hint), style = MaterialTheme.typography.bodySmall)
+            Text(stringResource(R.string.crs_brief_title), fontSize = 14.sp)
+            Text(stringResource(R.string.crs_brief_hint), fontSize = 12.sp)
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 FilterChip(selected = guided, onClick = { guided = true }, label = { Text(stringResource(R.string.crs_mode_chat)) })
                 FilterChip(selected = !guided, onClick = { guided = false }, label = { Text(stringResource(R.string.crs_mode_direct_draft)) })
@@ -773,10 +849,10 @@ private fun CreationBriefForm(kind: CreationKind, busy: Boolean, onStart: (Strin
                     OutlinedTextField(value = characters, onValueChange = { characters = it }, modifier = Modifier.fillMaxWidth(),
                         label = { Text(stringResource(R.string.crs_field_characters)) }, minLines = 3, maxLines = 6)
                     if (characters.lineSequence().count { it.isNotBlank() } < 2) {
-                        Text(stringResource(R.string.crs_min_characters_hint), style = MaterialTheme.typography.bodySmall)
+                        Text(stringResource(R.string.crs_min_characters_hint), fontSize = 12.sp)
                     }
                 }
-                Text(stringResource(R.string.crs_length_title), style = MaterialTheme.typography.labelMedium)
+                Text(stringResource(R.string.crs_length_title), fontSize = 12.sp)
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     CreationDetail.entries.forEach { option ->
                         // CreationDetail.label is also part of the LLM prompt; localize display here only.
@@ -811,8 +887,8 @@ private fun CreationBriefForm(kind: CreationKind, busy: Boolean, onStart: (Strin
 private fun PanelCard(content: @Composable ColumnScope.() -> Unit) {
     Surface(
         shape = RoundedCornerShape(14.dp),
-        color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        color = Dsh.bgBase,
+        border = BorderStroke(1.dp, Dsh.borderL3),
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp), content = content)
@@ -825,8 +901,8 @@ private fun DraftSection(title: String, initiallyExpanded: Boolean = false, cont
     var expanded by rememberSaveable(title) { mutableStateOf(initiallyExpanded) }
     Surface(
         shape = RoundedCornerShape(14.dp),
-        color = MaterialTheme.colorScheme.surface,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        color = Dsh.bgBase,
+        border = BorderStroke(1.dp, Dsh.borderL3),
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column {
@@ -836,9 +912,9 @@ private fun DraftSection(title: String, initiallyExpanded: Boolean = false, cont
                     .padding(horizontal = 14.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(title, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                Text(title, fontSize = 13.sp, modifier = Modifier.weight(1f))
                 Icon(if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
-                    contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    contentDescription = null, tint = Dsh.textSecondary)
             }
             if (expanded) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp), content = content)
@@ -849,14 +925,19 @@ private fun DraftSection(title: String, initiallyExpanded: Boolean = false, cont
 
 @Composable
 private fun CharacterDraftEditor(
-    card: CharacterDraft,
+    session: CreationSession,
     coverPng: ByteArray?,
     viewModel: CreationViewModel,
     busy: Boolean,
+    coverEngines: Set<String>,
+    isGeneratingCover: Boolean,
     onPickCover: () -> Unit,
     onExportJson: () -> Unit,
     onExportPng: () -> Unit,
+    onGenerateCover: () -> Unit,
 ) {
+    val card = session.card
+    val clipboard = LocalClipboardManager.current
     val coverBitmap = remember(coverPng) {
         coverPng?.let { BitmapFactory.decodeByteArray(it, 0, it.size)?.asImageBitmap() }
     }
@@ -866,9 +947,18 @@ private fun CharacterDraftEditor(
             if (coverBitmap != null) {
                 Image(coverBitmap, contentDescription = stringResource(R.string.crs_cover_cd),
                     modifier = Modifier.fillMaxWidth().height(180.dp), contentScale = ContentScale.Fit)
-            } else Text(stringResource(R.string.crs_cover_missing_hint), style = MaterialTheme.typography.bodySmall)
+            } else Text(stringResource(R.string.crs_cover_missing_hint), fontSize = 12.sp)
             OutlinedButton(onClick = onPickCover, enabled = !busy) {
                 Text(if (coverPng == null) stringResource(R.string.crs_cover_pick) else stringResource(R.string.crs_cover_change))
+            }
+            if (coverEngines.isNotEmpty()) {
+                OutlinedButton(onClick = onGenerateCover, enabled = !busy && !isGeneratingCover) {
+                    Text(if (isGeneratingCover) {
+                        stringResource(R.string.crs_cover_generating)
+                    } else {
+                        stringResource(R.string.crs_cover_generate)
+                    })
+                }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = onExportJson, enabled = !busy) { Text(stringResource(R.string.crs_export_json)) }
@@ -896,7 +986,119 @@ private fun CharacterDraftEditor(
                 viewModel.editCard { c -> c.copy(tags = value.split(',', '，').map(String::trim).filter(String::isNotBlank)) }
             }
         }
+        DraftSection(stringResource(R.string.crs_section_blueprint)) {
+            // The standard profile is regenerated from the draft on every
+            // export; this section only shows its current compiled shape and
+            // offers the one-shot generation request.
+            val hasContent = card.name.isNotBlank() || card.description.isNotBlank()
+            Text(
+                if (hasContent) stringResource(R.string.crs_blueprint_summary, session.lore.size)
+                else stringResource(R.string.crs_blueprint_empty_hint),
+                fontSize = 12.sp,
+                color = Dsh.textSecondary,
+            )
+            if (card.coverPrompt.isNotBlank()) {
+                Text(
+                    stringResource(R.string.crs_blueprint_cover_prompt_line, card.coverPrompt),
+                    fontSize = 12.sp,
+                    color = Dsh.textSecondary,
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = { viewModel.send(blueprintRequestPrompt()) },
+                    enabled = !busy,
+                ) { Text(stringResource(R.string.crs_blueprint_generate)) }
+                OutlinedButton(
+                    onClick = {
+                        clipboard.setText(AnnotatedString(CharacterBlueprintCompiler.compileToJson(session)))
+                    },
+                    enabled = true,
+                ) { Text(stringResource(R.string.crs_blueprint_copy_json)) }
+            }
+        }
     }
+}
+
+/**
+ * AI cover generation: engine choice across built-ins and configured custom
+ * profiles, prompt prefilled from the blueprint's cover_prompt when present.
+ */
+@Composable
+private fun CoverGenerationDialog(
+    engines: Set<String>,
+    profiles: List<ImageProviderProfile>,
+    initialPrompt: String,
+    isGenerating: Boolean,
+    onGenerate: (prompt: String, negativePrompt: String, engineId: String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var prompt by rememberSaveable(initialPrompt) { mutableStateOf(initialPrompt) }
+    var negative by rememberSaveable { mutableStateOf("") }
+    val defaultEngine = engines.firstOrNull() ?: ""
+    var selectedEngineId by remember { mutableStateOf(defaultEngine) }
+    AlertDialog(
+        onDismissRequest = { if (!isGenerating) onDismiss() },
+        title = { Text(stringResource(R.string.crs_cover_generate_title)) },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(stringResource(R.string.chat_engine_label), fontSize = 13.sp)
+                engines.forEach { engineId ->
+                    val label = when (engineId) {
+                        ProviderCatalog.COMFYUI -> "ComfyUI"
+                        ProviderCatalog.NOVELAI_IMAGE -> "NovelAI"
+                        else -> profiles.firstOrNull {
+                            it.id == engineId.removePrefix(ProviderConfigPersistence.IMAGE_PROFILE_PREFIX)
+                        }?.name ?: engineId
+                    }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        RadioButton(
+                            selected = selectedEngineId == engineId,
+                            onClick = { selectedEngineId = engineId },
+                        )
+                        Text(label, fontSize = 13.sp)
+                    }
+                }
+                OutlinedTextField(
+                    value = prompt,
+                    onValueChange = { prompt = it },
+                    label = { Text(stringResource(R.string.crs_cover_generate_prompt_label)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 3,
+                    maxLines = 8,
+                    placeholder = { Text("1girl, solo, masterpiece, best quality...") },
+                )
+                OutlinedTextField(
+                    value = negative,
+                    onValueChange = { negative = it },
+                    label = { Text(stringResource(R.string.chat_negative_prompt)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 1,
+                    maxLines = 4,
+                    placeholder = { Text("lowres, bad anatomy, bad hands...") },
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onGenerate(prompt.trim(), negative.trim(), selectedEngineId) },
+                enabled = !isGenerating && prompt.isNotBlank() && selectedEngineId.isNotEmpty(),
+            ) {
+                Text(stringResource(R.string.crs_cover_generate_confirm))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !isGenerating) {
+                Text(stringResource(R.string.chat_image_gen_cancel))
+            }
+        },
+    )
 }
 
 @Composable
@@ -912,10 +1114,10 @@ private fun AdvancedAssetsPanel(session: CreationSession, viewModel: CreationVie
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(stringResource(R.string.crs_assets_summary, scripts.size, regexes.size, variables.size),
-            style = MaterialTheme.typography.titleMedium)
+            fontSize = 14.sp)
         Text(stringResource(R.string.crs_assets_hint),
-            style = MaterialTheme.typography.bodySmall)
-        OutlinedButton(onClick = { viewModel.send("请检查并概述当前脚本、正则和变量，列出缺少的运行模块及下一步。") },
+            fontSize = 12.sp)
+        OutlinedButton(onClick = { viewModel.send(UiStrings.get(S.creng_quick_check_assets)) },
             enabled = !busy) { Text(stringResource(R.string.crs_btn_check_assets)) }
         scripts.forEach { item ->
             val script = item as? JsonObject ?: return@forEach
@@ -955,7 +1157,7 @@ private fun WorldDraftEditor(
                         .decode(ByteBuffer.wrap(bytes)).toString().removePrefix("\uFEFF")
                 }.getOrElse { error(context.getString(R.string.crs_error_not_utf8)) }
                 viewModel.setSource(
-                    UriUtils.resolveDisplayName(context, uri) ?: uri.lastPathSegment ?: "导入原文",
+                    UriUtils.resolveDisplayName(context, uri) ?: uri.lastPathSegment ?: UiStrings.get(S.crs_import_source_name),
                     decoded,
                 )
             } catch (e: Exception) {
@@ -980,7 +1182,7 @@ private fun WorldDraftEditor(
                 label = { Text(stringResource(R.string.crs_field_paste_source)) }, minLines = 3, maxLines = 6, enabled = !busy,
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { viewModel.setSource("粘贴原文", pastedSource); pastedSource = "" },
+                Button(onClick = { viewModel.setSource(UiStrings.get(S.crs_paste_source_name), pastedSource); pastedSource = "" },
                     enabled = !busy && pastedSource.isNotBlank()) { Text(stringResource(R.string.crs_save_source)) }
                 OutlinedButton(onClick = { filePicker.launch(arrayOf("text/plain", "*/*")) }, enabled = !busy) { Text(stringResource(R.string.crs_import_text_file)) }
             }
@@ -991,15 +1193,22 @@ private fun WorldDraftEditor(
                     Text(if (session.sourceCursor == 0) stringResource(R.string.crs_start_extract) else stringResource(R.string.crs_continue_extract))
                 }
             }
-            Text(stringResource(R.string.crs_lore_count, session.lore.size), style = MaterialTheme.typography.titleMedium)
-            val repeatedTitles = session.lore.groupBy { it.title.trim().lowercase() }
-                .filter { (title, entries) -> title.isNotBlank() && entries.size > 1 }
+            Text(stringResource(R.string.crs_lore_count, session.lore.size), fontSize = 14.sp)
+            val repeatedTitles = remember(session.lore) {
+                session.lore.groupBy { it.title.trim().lowercase() }
+                    .filter { (title, entries) -> title.isNotBlank() && entries.size > 1 }
+            }
             if (repeatedTitles.isNotEmpty()) {
-                Text(stringResource(R.string.crs_duplicate_titles, repeatedTitles.size), color = MaterialTheme.colorScheme.error)
+                Text(stringResource(R.string.crs_duplicate_titles, repeatedTitles.size), color = Dsh.errorPrimary)
             }
             }
         }
-        itemsIndexed(session.lore, key = { index, _ -> "lore-$index" }) { index, item ->
+        // Keys follow the stable entry id so deleting an entry does not shift
+        // editor state (focus, selection) onto the wrong card; freshly added
+        // drafts are keyed by index until the id is assigned.
+        itemsIndexed(session.lore, key = { index, item ->
+            if (item.id.isNotBlank()) "lore-${item.id}" else "lore-idx-$index"
+        }) { index, item ->
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     DraftField(stringResource(R.string.crs_field_lore_title), item.title, busy) { viewModel.editLore(index, item.copy(title = it)) }
@@ -1023,14 +1232,14 @@ private fun WorldDraftEditor(
                     }
                     DraftField(stringResource(R.string.crs_field_note), item.note, busy, 2) { viewModel.editLore(index, item.copy(note = it)) }
                     if (item.sourceQuote.isNotBlank()) {
-                        Text(stringResource(R.string.crs_source_quote, item.sourceName, item.sourceOffset, item.sourceQuote), style = MaterialTheme.typography.bodySmall)
+                        Text(stringResource(R.string.crs_source_quote, item.sourceName, item.sourceOffset, item.sourceQuote), fontSize = 12.sp)
                     }
                     TextButton(onClick = { viewModel.editLore(index, null) }, enabled = !busy) { Text(stringResource(R.string.crs_delete_entry)) }
                 }
             }
         }
         item(key = "add-entry") {
-            OutlinedButton(onClick = { viewModel.editLore(session.lore.size, LoreDraft("新条目", emptyList(), "")) },
+            OutlinedButton(onClick = { viewModel.editLore(session.lore.size, LoreDraft(UiStrings.get(S.crs_new_entry_name), emptyList(), "")) },
                 enabled = !busy) { Text(stringResource(R.string.crs_add_entry)) }
         }
     }
@@ -1067,7 +1276,7 @@ private fun FrontendPreview(card: CharacterDraft, viewModel: CreationViewModel, 
             AndroidView(
                 modifier = Modifier.fillMaxWidth().height(previewHeight)
                     .clip(RoundedCornerShape(12.dp))
-                    .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(12.dp)),
+                    .border(1.dp, Dsh.borderL3, RoundedCornerShape(12.dp)),
                 factory = { context ->
                     WebView(context).apply {
                         settings.javaScriptEnabled = false
@@ -1080,14 +1289,20 @@ private fun FrontendPreview(card: CharacterDraft, viewModel: CreationViewModel, 
                         webView.value = this
                     }
                 },
-                update = { it.loadDataWithBaseURL(null, wrapPreviewHtml(card.frontendHtml), "text/html", "UTF-8", null) },
             )
+            // The HTML field recomposes on every keystroke; reloading there tore
+            // the page down per key. Restarting this effect on each change keeps
+            // only the last edit, so the preview reloads once typing pauses.
+            LaunchedEffect(card.frontendHtml) {
+                delay(400)
+                webView.value?.loadDataWithBaseURL(null, wrapPreviewHtml(card.frontendHtml), "text/html", "UTF-8", null)
+            }
         }
         DraftField(stringResource(R.string.crs_field_frontend_html), card.frontendHtml, busy, 8) { value ->
             viewModel.editCard { it.copy(frontendHtml = value) }
         }
         val issues = portableFrontendIssues(card.frontendHtml)
-        if (issues.isNotEmpty()) Text(stringResource(R.string.crs_portability_issues, issues.joinToString()), color = MaterialTheme.colorScheme.error)
+        if (issues.isNotEmpty()) Text(stringResource(R.string.crs_portability_issues, issues.joinToString()), color = Dsh.errorPrimary)
         Text(stringResource(R.string.crs_first_message_preview, card.firstMessage))
     }
 }

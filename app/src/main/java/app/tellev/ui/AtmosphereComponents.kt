@@ -7,12 +7,16 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Card
@@ -46,26 +50,40 @@ fun CharacterPortraitCard(
     modifier: Modifier = Modifier,
     onLongClick: (() -> Unit)? = null,
     trailing: @Composable () -> Unit = {},
+    /** 紧凑形制：书架 3 列网格用（更小圆角/内边距、封面 3:4、名称单行）。 */
+    compact: Boolean = false,
 ) {
+    val cardShape = RoundedCornerShape(if (compact) 14.dp else 22.dp)
     Card(
-        modifier = modifier.fillMaxWidth().combinedClickable(onClick = onClick, onLongClick = onLongClick),
-        shape = RoundedCornerShape(22.dp),
+        // 水波纹画在 clickable 节点上：不先裁剪，方形 ripple 会溢出圆角卡片；
+        // Surface 内部的裁剪在 modifier 之后，够不着外层的按压反馈。
+        modifier = modifier.fillMaxWidth().clip(cardShape).combinedClickable(onClick = onClick, onLongClick = onLongClick),
+        shape = cardShape,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLowest),
     ) {
-        Box(Modifier.fillMaxWidth().aspectRatio(0.85f)) {
+        Box(Modifier.fillMaxWidth().aspectRatio(if (compact) 0.75f else 0.85f)) {
             CharacterCover(file, name, Modifier.fillMaxSize())
             Box(Modifier.fillMaxSize().background(Brush.verticalGradient(
                 listOf(Color.Transparent, Color.Black.copy(alpha = 0.3f)),
             )))
-            Box(Modifier.align(Alignment.TopEnd).padding(8.dp)) { trailing() }
+            Box(Modifier.align(Alignment.TopEnd).padding(if (compact) 4.dp else 8.dp)) { trailing() }
         }
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text(name, style = MaterialTheme.typography.titleMedium, maxLines = 1,
-                overflow = TextOverflow.Ellipsis)
-            Text(tags.take(2).joinToString(" · ").ifBlank { "✦" },
-                style = MaterialTheme.typography.bodySmall,
+        Column(
+            Modifier.padding(horizontal = if (compact) 8.dp else 14.dp, vertical = if (compact) 6.dp else 14.dp),
+            verticalArrangement = Arrangement.spacedBy(if (compact) 2.dp else 6.dp),
+        ) {
+            Text(
+                name,
+                style = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.titleMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                tags.take(2).joinToString(" · ").ifBlank { "✦" },
+                style = if (compact) MaterialTheme.typography.labelSmall else MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1, overflow = TextOverflow.Ellipsis)
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
@@ -157,5 +175,110 @@ fun QuietTag(text: String, modifier: Modifier = Modifier) {
         Text(text, modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+/**
+ * The wooden shelf plank the screenshot's library sits on. Drawn, not an image:
+ * no asset, no decode, and it follows the current theme's surface tones.
+ */
+@Composable
+fun ShelfPlank(modifier: Modifier = Modifier) {
+    val shelf = MaterialTheme.colorScheme.surfaceContainerHighest
+    val shelfEdge = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f)
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(10.dp)
+            .background(shelf),
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(2.dp)
+                .align(Alignment.TopStart)
+                .background(shelfEdge),
+        )
+    }
+}
+
+/**
+ * One standing book on the shelf: a spine-strip card whose height follows the
+ * name length (long titles read as thicker books), so the shelf looks like
+ * books rather than a list. Presentation only — all interaction stays on the
+ * caller's clickable modifier.
+ */
+@Composable
+fun BookSpineCard(
+    name: String,
+    entryCount: Int,
+    activated: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    trailing: @Composable () -> Unit = {},
+) {
+    val spineColors = listOf(
+        Color(0xFF6B4A34), Color(0xFF3E5A50), Color(0xFF5A4A6B), Color(0xFF6B5A34), Color(0xFF4A5A6B),
+    )
+    val spine = spineColors[(name.hashCode() and Int.MAX_VALUE) % spineColors.size]
+    val height = (96 + (name.length.coerceAtMost(14) * 4)).dp
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(10.dp),
+        color = spine,
+        modifier = modifier.height(height),
+    ) {
+        Box(Modifier.fillMaxSize()) {
+            // Spine highlight + edge, the two strokes that read as "book" at a glance.
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.horizontalGradient(
+                            listOf(
+                                Color.White.copy(alpha = 0.16f),
+                                Color.Transparent,
+                                Color.Black.copy(alpha = 0.22f),
+                            ),
+                        ),
+                    ),
+            )
+            Box(
+                Modifier
+                    .align(Alignment.CenterStart)
+                    .width(3.dp)
+                    .fillMaxHeight()
+                    .background(Color.White.copy(alpha = 0.28f)),
+            )
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    name,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = Color.White,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "$entryCount",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.White.copy(alpha = 0.85f),
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        if (activated) "●" else "○",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (activated) Color(0xFF9BE39B) else Color.White.copy(alpha = 0.6f),
+                    )
+                }
+            }
+            Box(Modifier.align(Alignment.TopEnd).padding(4.dp)) { trailing() }
+        }
     }
 }

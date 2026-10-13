@@ -18,6 +18,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -31,15 +32,15 @@ internal fun ImageGenerationDialog(
     initialPrompt: String,
     initialEngine: String?,
     configuredEngines: Set<String>,
+    profiles: List<ChatImageProfileOption> = emptyList(),
     onShowDiagnostic: (() -> Unit)? = null,
     onGenerate: (prompt: String, negativePrompt: String, summarizeScene: Boolean, engine: String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var prompt by remember { mutableStateOf(initialPrompt) }
-    var negative by remember { mutableStateOf("") }
+    var prompt by rememberSaveable { mutableStateOf(initialPrompt) }
+    var negative by rememberSaveable { mutableStateOf("") }
     var summarizeScene by remember { mutableStateOf(false) }
     var selectedEngineId by remember(initialEngine) { mutableStateOf(initialEngine) }
-    val selectedEngine = selectedEngineId?.let(ChatImageEngine::fromProviderId)
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -54,28 +55,22 @@ internal fun ImageGenerationDialog(
                     TextButton(onClick = onShowDiagnostic) { Text(stringResource(R.string.chat_view_last_diagnostic)) }
                 }
                 ChatImageEngine.entries.forEach { engine ->
-                    val configured = engine.providerId in configuredEngines
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 2.dp),
-                    ) {
-                        RadioButton(
-                            selected = selectedEngineId == engine.providerId,
-                            onClick = { selectedEngineId = engine.providerId },
-                            enabled = configured,
-                        )
-                        Text(
-                            text = engine.label + if (configured) "" else stringResource(R.string.chat_engine_not_configured),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = if (configured) {
-                                MaterialTheme.colorScheme.onSurface
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
-                            },
-                        )
-                    }
+                    EngineRow(
+                        engineId = engine.providerId,
+                        label = engine.label,
+                        configured = engine.providerId in configuredEngines,
+                        selectedEngineId = selectedEngineId,
+                        onSelect = { selectedEngineId = engine.providerId },
+                    )
+                }
+                profiles.forEach { profile ->
+                    EngineRow(
+                        engineId = profile.engineId,
+                        label = profile.label,
+                        configured = true,
+                        selectedEngineId = selectedEngineId,
+                        onSelect = { selectedEngineId = profile.engineId },
+                    )
                 }
 
                 Row(
@@ -124,7 +119,7 @@ internal fun ImageGenerationDialog(
         },
         confirmButton = {
             TextButton(
-                onClick = { selectedEngine?.let { onGenerate(prompt.trim(), negative.trim(), summarizeScene, it.providerId) } },
+                onClick = { selectedEngineId?.let { onGenerate(prompt.trim(), negative.trim(), summarizeScene, it) } },
                 enabled = selectedEngineId in configuredEngines && (summarizeScene || prompt.isNotBlank()),
             ) {
                 Text(stringResource(R.string.chat_generate))
@@ -136,4 +131,36 @@ internal fun ImageGenerationDialog(
             }
         },
     )
+}
+
+/** One engine choice row: a built-in engine or a custom endpoint profile. */
+@Composable
+private fun EngineRow(
+    engineId: String,
+    label: String,
+    configured: Boolean,
+    selectedEngineId: String?,
+    onSelect: () -> Unit,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp),
+    ) {
+        RadioButton(
+            selected = selectedEngineId == engineId,
+            onClick = onSelect,
+            enabled = configured,
+        )
+        Text(
+            text = label + if (configured) "" else stringResource(R.string.chat_engine_not_configured),
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (configured) {
+                MaterialTheme.colorScheme.onSurface
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+            },
+        )
+    }
 }

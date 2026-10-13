@@ -2,7 +2,9 @@ package app.tellev.feature.creation
 
 import app.tellev.core.i18n.S
 import app.tellev.core.i18n.UiStrings
+import app.tellev.core.model.Attachment
 import app.tellev.core.model.CharacterCard
+import app.tellev.core.model.ReasoningEffort
 import app.tellev.core.model.WorldBook
 import app.tellev.core.model.WorldBookEntry
 import kotlinx.serialization.Serializable
@@ -10,12 +12,32 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.util.UUID
 
 @Serializable
 enum class CreationKind { Character, WorldBook }
+
+/**
+ * Exported frontend fragments are delimited by this HTML comment (invisible
+ * whenever the message is rendered) so that re-importing an exported card
+ * restores the Frontend editor instead of leaving it blank and stacking a
+ * second copy on the next export (O11). Cards exported before the marker
+ * existed keep the old flat layout: their fragment stays inside
+ * first_message and is simply shown as part of the message.
+ */
+const val FRONTEND_MARKER = "<!-- tellev-frontend -->"
+
+/** Splits an exported message back into body text and frontend fragment (O11). */
+internal fun splitFrontend(message: String): Pair<String, String?> {
+    val index = message.indexOf(FRONTEND_MARKER)
+    if (index < 0) return message to null
+    val body = message.substring(0, index).trimEnd()
+    val fragment = message.substring(index + FRONTEND_MARKER.length).trim()
+    return body to fragment.ifBlank { null }
+}
 
 /**
  * Draft row for the creation home screen. A full CreationSession graph keeps
@@ -37,7 +59,54 @@ data class CreationSessionSummary(
 )
 
 @Serializable
-data class CreationTurn(val role: String, val text: String)
+data class CreationTurn(
+    val role: String,
+    val text: String,
+    val attachments: List<Attachment> = emptyList(),
+)
+
+/**
+ * Per-draft usage of the authoring agent, accumulated across every completed
+ * provider request (each tool-loop round, each extraction/repair request).
+ *
+ * Only provider-reported samples are counted as reported values; requests that
+ * finished without a usage frame still increment [completedRequests] and
+ * [estimatedCount] so the count stays honest while the token sums stay empty.
+ * [promptTokens] is the full prompt (cache read + write + uncached).
+ */
+@Serializable
+data class CreationUsage(
+    val completedRequests: Int = 0,
+    val estimatedCount: Int = 0,
+    val promptTokens: Long = 0L,
+    val completionTokens: Long = 0L,
+    val cacheReadTokens: Long = 0L,
+    val cacheWriteTokens: Long = 0L,
+    val reasoningTokens: Long = 0L,
+    val lastModel: String = "",
+    val lastTokensPerSecond: Double? = null,
+    val lastEstimated: Boolean = false,
+) {
+    val totalTokens: Long get() = promptTokens + completionTokens
+    val uncachedInputTokens: Long
+        get() = (promptTokens - cacheReadTokens - cacheWriteTokens).coerceAtLeast(0L)
+
+    fun plus(metric: app.tellev.core.metrics.GenerationMetrics): CreationUsage {
+        val reported = !metric.isEstimate && metric.promptTokens != null
+        return copy(
+            completedRequests = completedRequests + 1,
+            estimatedCount = estimatedCount + if (reported) 0 else 1,
+            promptTokens = promptTokens + (if (reported) metric.promptTokens?.toLong() ?: 0L else 0L),
+            completionTokens = completionTokens + (if (reported) metric.completionTokens?.toLong() ?: 0L else 0L),
+            cacheReadTokens = cacheReadTokens + (if (reported) (metric.cacheReadTokens ?: metric.cachedTokens)?.toLong() ?: 0L else 0L),
+            cacheWriteTokens = cacheWriteTokens + (if (reported) metric.cacheCreationTokens?.toLong() ?: 0L else 0L),
+            reasoningTokens = reasoningTokens + (if (reported) metric.reasoningTokens?.toLong() ?: 0L else 0L),
+            lastModel = metric.model.orEmpty(),
+            lastTokensPerSecond = metric.decodeTokensPerSecond ?: metric.tokensPerSecond,
+            lastEstimated = metric.isEstimate,
+        )
+    }
+}
 
 /** One executed (or rejected) tool call inside a conversation turn, for the activity UI. */
 data class CreationToolEvent(
@@ -68,6 +137,11 @@ data class CharacterDraft(
     val tags: List<String> = emptyList(),
     /** Portable HTML/CSS fragment placed in the opening message after review. */
     val frontendHtml: String = "",
+    /**
+     * English tag-style image prompt for the AI cover generator; written by the
+     * agent through write_blueprint and exported inside the standard profile.
+     */
+    val coverPrompt: String = "",
 )
 
 @Serializable
@@ -128,6 +202,19 @@ data class CreationSession(
     val originalBook: WorldBook? = null,
     /** Editable SillyTavern extension tree; unknown keys remain untouched. */
     val advancedExtensions: JsonObject = JsonObject(emptyMap()),
+    /** Provider request accounting for this draft (see [CreationUsage]). */
+    val usage: CreationUsage = CreationUsage(),
+    /**
+     * Per-draft reasoning effort override ("跟随预设" is represented by Auto).
+     * Kept beside [usage] rather than inside the card so switching drafts never
+     * leaks one draft's effort into another.
+     */
+    val reasoningEffort: ReasoningEffort = ReasoningEffort.Auto,
+    /**
+     * 本草案指定的预设 id（空 = 跟随聊天当前所选，即引擎默认行为）。
+     * 与 [reasoningEffort] 同理存于草案侧，避免跨草稿串台。
+     */
+    val presetId: String = "",
 ) {
     companion object {
         fun fromCharacter(card: CharacterCard): CreationSession {
@@ -135,6 +222,20 @@ data class CreationSession(
             fun dataString(key: String): String =
                 runCatching { data?.get(key)?.jsonPrimitive?.content }.getOrNull().orEmpty()
             val book = card.characterBook
+            // O11: recover an exported frontend fragment so editing an existing
+            // card shows the Frontend page, and the next export cannot stack a
+            // second copy of the fragment onto the messages.
+            val (firstBody, firstFragment) = splitFrontend(card.firstMessage)
+            val greetings = card.alternateGreetings.map(::splitFrontend)
+            val frontendHtml = firstFragment
+                ?: greetings.firstNotNullOfOrNull { it.second }
+                ?: ""
+            // The AI cover prompt lives inside the exported standard profile;
+            // recover it so cover generation can prefill on the next edit.
+            val extensions = data?.get("extensions") as? JsonObject
+            val profileJson = extensions?.get(CharacterBlueprintCompiler.EXTENSION_KEY) as? JsonObject
+            val coverPromptValue = profileJson?.get("cover_prompt") as? JsonPrimitive
+            val coverPrompt = coverPromptValue?.contentOrNull.orEmpty()
             return CreationSession(
                 kind = CreationKind.Character,
                 card = CharacterDraft(
@@ -142,13 +243,15 @@ data class CreationSession(
                     description = card.description,
                     personality = card.personality,
                     scenario = card.scenario,
-                    firstMessage = card.firstMessage,
-                    alternateGreetings = card.alternateGreetings,
+                    firstMessage = firstBody,
+                    alternateGreetings = greetings.map { it.first },
                     exampleMessages = card.exampleMessages,
                     systemPrompt = dataString("system_prompt"),
                     postHistoryInstructions = dataString("post_history_instructions"),
                     creatorNotes = card.creatorNotes,
                     tags = card.tags,
+                    frontendHtml = frontendHtml,
+                    coverPrompt = coverPrompt,
                 ),
                 worldName = book?.name.orEmpty(),
                 lore = book?.entries.orEmpty().map(WorldBookEntry::toLoreDraft),
@@ -174,7 +277,7 @@ data class CreationSession(
                 id = "creation_${UUID.randomUUID()}",
                 kind = CreationKind.WorldBook,
                 worldName = card.characterBook?.name?.takeIf(String::isNotBlank)
-                    ?: "${card.name}世界书",
+                    ?: UiStrings.get(S.creng_default_worldbook_name, card.name),
                 savedArtifactId = "",
                 sourceName = card.name,
                 // The source card remains available to read_card, while the
@@ -222,8 +325,14 @@ fun CreationSession.withAssignedLoreIds(): CreationSession {
 /** All generated fields are kept in the standard V2 data object. */
 fun CreationSession.toCharacterCard(): CharacterCard {
     require(kind == CreationKind.Character && card.name.isNotBlank())
-    fun withFrontend(opening: String): String = listOf(opening.trim(), card.frontendHtml.trim())
-        .filter { it.isNotBlank() }.joinToString("\n\n")
+    fun withFrontend(opening: String): String {
+        val message = opening.trim()
+        val fragment = card.frontendHtml.trim()
+        if (fragment.isEmpty()) return message
+        // The marker line (see FRONTEND_MARKER) lets fromCharacter split the
+        // fragment back out on the next import instead of stacking copies.
+        return listOf(message, FRONTEND_MARKER, fragment).joinToString("\n\n")
+    }
     val opening = withFrontend(card.firstMessage)
     // Both the typed card and raw.data must carry the same list: the exporter
     // lets raw.data shadow alternate_greetings, so a divergence would strip
@@ -236,13 +345,16 @@ fun CreationSession.toCharacterCard(): CharacterCard {
         put("data", buildJsonObject {
             put("system_prompt", card.systemPrompt)
             put("post_history_instructions", card.postHistoryInstructions)
-            put("creator", "Tellev AI 协作创作")
+            put("creator", UiStrings.get(S.creng_card_creator))
             put("character_version", "1.0")
         })
     }
     val rawData = rawBeforeExtensions["data"] as? JsonObject ?: JsonObject(emptyMap())
-    val extensions = advancedExtensions.takeIf { it.isNotEmpty() }
-        ?: rawData["extensions"] as? JsonObject ?: JsonObject(emptyMap())
+    // The standard profile is regenerated from the final draft on every export,
+    // so it can never go stale against later edits; third-party extension keys
+    // in advancedExtensions pass through untouched.
+    val extensions = JsonObject(advancedExtensions +
+        (CharacterBlueprintCompiler.EXTENSION_KEY to CharacterBlueprintCompiler.compile(this)))
     val raw = JsonObject(rawBeforeExtensions + ("data" to JsonObject(rawData +
         ("extensions" to extensions))))
     return CharacterCard(
@@ -299,7 +411,7 @@ private fun mergedCardRaw(
 
 fun CreationSession.toWorldBook(): WorldBook = WorldBook(
     id = savedArtifactId.ifBlank { "wb_${UUID.randomUUID()}" },
-    name = worldName.ifBlank { card.name.ifBlank { "新世界书" } },
+    name = worldName.ifBlank { card.name.ifBlank { UiStrings.get(S.creng_new_worldbook_name) } },
     entries = lore.mapIndexed { index, item ->
         val original = item.originalEntry
         if (original != null) original.copy(

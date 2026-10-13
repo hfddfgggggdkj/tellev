@@ -9,6 +9,7 @@ import androidx.lifecycle.viewModelScope
 import app.tellev.core.i18n.S
 import app.tellev.core.i18n.UiStrings
 import app.tellev.core.storage.AppPreferences
+import app.tellev.core.update.UpdateApkVerifier
 import app.tellev.core.update.UpdateChecker
 import app.tellev.core.update.UpdateInfo
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -28,6 +29,12 @@ data class UpdateUiState(
     val progress: Float = 0f,
     /** Set after the install intent has been launched (APK downloaded + handed off). */
     val installStarted: Boolean = false,
+    /**
+     * 本次下载的发行没有 sha256 digest：APK 未经哈希校验（只有签名证书比对兜底）。
+     * [UpdateChecker.downloadApk] 的 onHashUnverified 事件落到这里，界面据此给出
+     * 可见处置（MF-8）。
+     */
+    val hashUnverified: Boolean = false,
     /** Whether the launch check is enabled (设置 → 关于 switch). */
     val autoCheckEnabled: Boolean = true,
 )
@@ -95,19 +102,45 @@ class UpdateViewModel(
     }
 
     /**
-     * Downloads the pending update's APK (mirror fallback, integrity-checked)
-     * and launches the system installer. The APK is written to the cache dir
+     * Downloads the pending update's APK (mirror fallback, integrity-checked),
+     * verifies its signing certificate against the running build, and only
+     * then launches the system installer. The APK is written to the cache dir
      * and exposed via FileProvider under the `${packageName}.fileprovider`
      * authority.
      */
     fun downloadAndInstall() {
         val info = _uiState.value.pendingUpdate ?: return
         viewModelScope.launch {
-            _uiState.update { it.copy(downloading = true, progress = 0f, error = null) }
+            _uiState.update { it.copy(downloading = true, progress = 0f, error = null, hashUnverified = false) }
             try {
-                val target = File(appContext.cacheDir, "tellev-update.apk")
-                checker.downloadApk(info, UpdateChecker.DEFAULT_MIRRORS, target) { p ->
-                    _uiState.update { it.copy(progress = p) }
+                // Must match res/xml/file_paths.xml (cache-path "update_apk").
+                val target = File(File(appContext.cacheDir, "update").apply { mkdirs() }, "tellev-update.apk")
+                // onProgress must be named: downloadApk gained the trailing
+                // onHashUnverified callback, so a bare trailing lambda would bind
+                // to that one instead.
+                checker.downloadApk(
+                    info,
+                    UpdateChecker.DEFAULT_MIRRORS,
+                    target,
+                    onProgress = { p ->
+                        _uiState.update { it.copy(progress = p) }
+                    },
+                    // MF-8：发行没带 digest 时不再只有 stderr 一条出路——事件落到
+                    // _uiState，界面据此给出可见处置。
+                    onHashUnverified = {
+                        _uiState.update { it.copy(hashUnverified = true) }
+                    },
+                )
+                // Last integrity gate before hand-off: a mirror could serve a
+                // re-signed APK whose checksum matches its own fake digest.
+                // A mismatching package is deleted, never shown to the user.
+                when (val verdict = UpdateApkVerifier.verify(appContext, target)) {
+                    is UpdateApkVerifier.Verdict.Valid -> Unit
+                    is UpdateApkVerifier.Verdict.Invalid -> {
+                        target.delete()
+                        android.util.Log.w("tellev-update", "Update APK rejected: ${verdict.reason}")
+                        throw IllegalStateException(UiStrings.get(S.updvm_apk_rejected))
+                    }
                 }
                 val uri = FileProvider.getUriForFile(
                     appContext,

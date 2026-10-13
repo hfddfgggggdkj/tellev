@@ -34,6 +34,7 @@ import kotlin.io.path.listDirectoryEntries
 import kotlin.io.path.name
 import kotlin.io.path.nameWithoutExtension
 import kotlin.io.path.outputStream
+import kotlin.io.path.readBytes
 import kotlin.io.path.readText
 
 internal class PresetRepository(
@@ -45,7 +46,13 @@ internal class PresetRepository(
     suspend fun listPresets(): List<GenerationPreset> = withContext(Dispatchers.IO) {
         presetDirectoriesWithCategories().flatMap { (category, root) ->
             StorageFileOps.readJsonFiles(root, json).filterNot { (path, _) -> path.nameWithoutExtension == "in_use" }
-                .map { (path, raw) -> PresetCodec.parsePreset(path, raw, category, resolvePresetDirectory(category).name) }
+                .mapNotNull { (path, raw) ->
+                    // One broken preset file must not take down the whole list;
+                    // the bad file is skipped and the rest stay loadable.
+                    runCatching {
+                        PresetCodec.parsePreset(path, raw, category, resolvePresetDirectory(category).name)
+                    }.getOrNull()
+                }
         }
     }
 
@@ -72,7 +79,10 @@ internal class PresetRepository(
             val directory = resolvePresetDirectory(category)
             val source = safeStorageChild(directory, name, ".json")
             if (!source.exists()) error(UiStrings.get(S.prrepo_error_not_found, category.name.lowercase(), name))
-            source.copyTo(directory.resolve("in_use.json"), overwrite = true)
+            // M5: a plain copyTo here could leave a truncated/missing in_use.json on
+            // process death; route it through the same journaled write as the
+            // selection state right below.
+            StorageFileOps.durableWriteBytes(durableFiles, directory.resolve("in_use.json"), source.readBytes())
 
             val statePath = layout.root.resolve("preset-selection.json")
             val current = if (statePath.exists()) {
@@ -88,21 +98,29 @@ internal class PresetRepository(
         val parent = resolvePresetDirectory(if (preset.category == PresetCategory.OpenAi) presetCategory(preset.providerType) else preset.category)
         parent.createDirectories()
         val merged = preset.raw.toMutableMap()
-        preset.temperature?.let { merged["temperature"] = JsonPrimitive(it) }
-        preset.topP?.let { merged["top_p"] = JsonPrimitive(it) }
-        preset.topK?.let { merged["top_k"] = JsonPrimitive(it) }
-        preset.topA?.let { merged["top_a"] = JsonPrimitive(it) }
-        preset.minP?.let { merged["min_p"] = JsonPrimitive(it) }
-        preset.repetitionPenalty?.let { merged["repetition_penalty"] = JsonPrimitive(it) }
-        preset.repetitionPenaltyRange?.let { merged["repetition_penalty_range"] = JsonPrimitive(it) }
-        preset.presencePenalty?.let { merged["presence_penalty"] = JsonPrimitive(it) }
-        preset.frequencyPenalty?.let { merged["frequency_penalty"] = JsonPrimitive(it) }
-        preset.seed?.let { merged["seed"] = JsonPrimitive(it) }
-        preset.maxContextTokens?.let { merged["openai_max_context"] = JsonPrimitive(it) }
-        (preset.maxCompletionTokens ?: preset.maxTokens)?.let {
-            merged["openai_max_tokens"] = JsonPrimitive(it)
-            merged["max_tokens"] = JsonPrimitive(it)
+        // Typed nulls mean "clear": every alias the parser would read the value
+        // back from is removed, otherwise a cleared field silently resurrected
+        // from its legacy raw key on the next load.
+        fun clear(vararg keys: String) = keys.forEach(merged::remove)
+        if (preset.temperature != null) merged["temperature"] = JsonPrimitive(preset.temperature) else clear("temperature", "temp", "temp_openai")
+        if (preset.topP != null) merged["top_p"] = JsonPrimitive(preset.topP) else clear("top_p", "topP")
+        if (preset.topK != null) merged["top_k"] = JsonPrimitive(preset.topK) else clear("top_k", "topK")
+        if (preset.topA != null) merged["top_a"] = JsonPrimitive(preset.topA) else clear("top_a", "topA")
+        if (preset.minP != null) merged["min_p"] = JsonPrimitive(preset.minP) else clear("min_p", "minP")
+        if (preset.repetitionPenalty != null) merged["repetition_penalty"] = JsonPrimitive(preset.repetitionPenalty) else clear("repetition_penalty", "rep_pen")
+        if (preset.repetitionPenaltyRange != null) merged["repetition_penalty_range"] = JsonPrimitive(preset.repetitionPenaltyRange) else clear("repetition_penalty_range", "rep_pen_range")
+        if (preset.presencePenalty != null) merged["presence_penalty"] = JsonPrimitive(preset.presencePenalty) else clear("presence_penalty")
+        if (preset.frequencyPenalty != null) merged["frequency_penalty"] = JsonPrimitive(preset.frequencyPenalty) else clear("frequency_penalty")
+        if (preset.seed != null) merged["seed"] = JsonPrimitive(preset.seed) else clear("seed")
+        if (preset.maxContextTokens != null) merged["openai_max_context"] = JsonPrimitive(preset.maxContextTokens) else clear("openai_max_context", "max_context", "context_length")
+        val completionTokens = preset.maxCompletionTokens ?: preset.maxTokens
+        if (completionTokens != null) {
+            merged["openai_max_tokens"] = JsonPrimitive(completionTokens)
+            merged["max_tokens"] = JsonPrimitive(completionTokens)
+        } else {
+            clear("openai_max_tokens", "max_tokens", "maxTokens", "max_new_tokens")
         }
+        if (preset.reasoningEffort != null) merged["reasoning_effort"] = JsonPrimitive(preset.reasoningEffort.name.lowercase()) else clear("reasoning_effort")
         if (preset.stop.isNotEmpty()) merged["stop"] = stringArray(preset.stop)
         if (preset.prompts.isNotEmpty() || preset.promptsUnused.isNotEmpty() || "prompts" in merged) {
             val definitions = (preset.prompts + preset.promptsUnused).distinctBy { it.identifier }
@@ -142,7 +160,10 @@ internal class PresetRepository(
         }
         var deletedAny = false
         targets.forEach { (category, directory) ->
-            if (safeStorageChild(directory, id, ".json").deleteIfExists()) {
+            val target = safeStorageChild(directory, id, ".json")
+            if (target.exists()) {
+                // Journal delete keeps the write log coherent with the removal.
+                durableFiles.delete(target)
                 deletedAny = true
                 ensureDefaultPreset(category)
                 if (readSelectedPresetName(category) == id) {
@@ -160,7 +181,10 @@ internal class PresetRepository(
         providerCategory: String,
         sourceFileName: String,
     ): PresetImportResult = withContext(Dispatchers.IO) {
-        val rawJsonString = jsonBytes.decodeToString()
+        // Windows Notepad / some ST tools export JSON with a UTF-8 BOM;
+        // kotlinx refuses to parse it. CharacterImporter already strips BOM,
+        // so imports behaved inconsistently across entry points.
+        val rawJsonString = jsonBytes.decodeToString().removePrefix("\uFEFF")
         val parsed = runCatching { json.parseToJsonElement(rawJsonString) }.getOrNull()
         val rawObj = parsed as? JsonObject
             ?: error(UiStrings.get(S.prrepo_error_invalid_json, sourceFileName))
@@ -177,8 +201,10 @@ internal class PresetRepository(
         var suffix = 2
         while (safeStorageChild(parent, id, ".json").exists()) id = "$baseStem-${suffix++}"
         val destination = safeStorageChild(parent, id, ".json")
-        destination.outputStream().use { it.write(jsonBytes) }
-        destination.copyTo(parent.resolve("in_use.json"), overwrite = true)
+        // M5: raw output-stream + copyTo were the one preset write path without
+        // journal discipline — a crash mid-import left half files behind.
+        StorageFileOps.durableWriteBytes(durableFiles, destination, jsonBytes)
+        StorageFileOps.durableWriteBytes(durableFiles, parent.resolve("in_use.json"), jsonBytes)
         val statePath = layout.root.resolve("preset-selection.json")
         val current = if (statePath.exists()) {
             runCatching { json.parseToJsonElement(statePath.readText()) as? JsonObject }.getOrNull()
@@ -267,7 +293,11 @@ internal class PresetRepository(
         val canonical = defaultPresetRaw(PresetCategory.OpenAi)
         StorageFileOps.durableWriteText(durableFiles, path, json.encodeToString(JsonObject.serializer(), canonical))
         if (runCatching { readSelectedPresetName(PresetCategory.OpenAi) }.getOrNull() == "default") {
-            path.copyTo(layout.openAiSettings.resolve("in_use.json"), overwrite = true)
+            StorageFileOps.durableWriteBytes(
+                durableFiles,
+                layout.openAiSettings.resolve("in_use.json"),
+                path.readBytes(),
+            )
         }
         presetChanges.tryEmit(PresetCategory.OpenAi)
     }

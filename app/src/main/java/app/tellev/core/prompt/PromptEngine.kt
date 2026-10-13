@@ -94,6 +94,8 @@ class DefaultPromptEngine(
     }
 
     override fun build(request: PromptBuildRequest): PromptBuildResult {
+        // 群像（1.7.1.4）：附属角色设定注入主请求；raw 直通模式不注入。
+        val request = CharacterCastPrompt.enrich(request, macroEngine)
         val rawGeneration = request.metadata["tavernRawGeneration"]?.jsonPrimitive?.booleanOrNull == true
         // 1. Build MacroContext from request data
         val macroContext = PromptMacroContextBuilder.buildMacroContext(request)
@@ -125,10 +127,15 @@ class DefaultPromptEngine(
         val maxContextTokens = request.preset.maxContextTokens
             ?: PromptMacroContextBuilder.extractMaxContextTokens(request.metadata)
             ?: DEFAULT_MAX_CONTEXT_TOKENS
-        val maxCompletionTokens = request.preset.maxCompletionTokens
+        // The output budget only rides the request when actually configured —
+        // sending the internal default (131072) as max_tokens 400s strict
+        // relays and local servers. The defaulted value still bounds the
+        // internal context math; adapters fall back to provider-appropriate
+        // behavior when it is null (Anthropic's required field → 8192).
+        val configuredMaxCompletionTokens = request.preset.maxCompletionTokens
             ?: request.preset.maxTokens
             ?: PromptMacroContextBuilder.extractMaxResponseTokens(request.metadata)
-            ?: DEFAULT_MAX_COMPLETION_TOKENS
+        val maxCompletionTokens = configuredMaxCompletionTokens ?: DEFAULT_MAX_COMPLETION_TOKENS
         val worldInfoTokenBudget = maxContextTokens
             ?.let { ((it.toLong() * 25L) / 100L).toInt() }
             ?.coerceAtLeast(1)
@@ -149,9 +156,14 @@ class DefaultPromptEngine(
             },
             maxContentTokens = worldInfoTokenBudget,
         )
+        val worldBookNamesByEntryId = request.worldBooks
+            .flatMap { book -> book.entries.map { entry -> entry.id to book.name } }
+            .toMap()
+        val worldScanDiagnostics = WorldInfoScanner.ScanDiagnostics()
         val worldScan = worldScanner.scan(
             entries = request.worldBooks.flatMap { it.entries },
             searchText = searchText,
+            diagnostics = worldScanDiagnostics,
             expand = { entry, content ->
                 promptTemplateProcessor.systemPromptContentFor(
                     PromptTemplateWorldEntry(
@@ -223,15 +235,18 @@ class DefaultPromptEngine(
                 macroEngine.expand(body, macroContext)
             } else body
         }
-        // Expose the same processed floors to templates and the model, retaining
-        // ST's message shape and its special handling of the original first floor.
-        val chatSnippets = visibleHistory.mapIndexed { index, message ->
+        // Templates read saved chat floors, including the current input. Reuse
+        // history expansions so side-effecting macros are not evaluated twice.
+        val expandedHistoryByMessage = IdentityHashMap<ChatMessage, String>().apply {
+            visibleHistory.forEachIndexed { index, message -> put(message, expandedHistory[index]) }
+        }
+        val chatSnippets = (request.macroMessages ?: request.messages).filterNot { it.isHidden }.mapIndexed { index, message ->
             PromptTemplateChatMessage(
                 id = index,
                 isUser = message.role == MessageRole.User,
                 isSystem = message.role == MessageRole.System,
                 name = message.name,
-                content = expandedHistory[index],
+                content = expandedHistoryByMessage[message] ?: message.reasoningParts().body,
             )
         }
         val groupNames = PromptMacroContextBuilder.groupMemberNamesList(request.metadata)
@@ -372,12 +387,19 @@ class DefaultPromptEngine(
             presetOrder.absoluteInjections + extensionInjections + characterInjections + anInjections + memoryInjection
         val injectionTokens = PromptInjectionProcessor.injectionTokenCost(allInjectionsForBudget)
         val quietTokens = quietPrompt?.let { TokenBudget.estimateTokens(it) + 4 } ?: 0
+        // Outgoing image attachments ride the final user turn (G2) and cost
+        // real context — roughly 800 tokens per image at mainstream
+        // resolutions. Reserving them keeps a with-image request from
+        // overflowing the window after the history was fitted.
+        val imageAttachmentCount = request.messages.lastOrNull { it.role == MessageRole.User }
+            ?.attachments?.count { it.mimeType.startsWith("image/") } ?: 0
+        val attachmentTokens = imageAttachmentCount * IMAGE_ATTACHMENT_TOKENS
         val budgetedRaw = TokenBudget.fitToBudget(
             systemPrompt = if (rawGeneration) "" else templatedSystemPrompt,
             worldInfo = emptyList(),
             characterDescription = "",
             messages = if (rawGeneration) templatedMessages else templatedMessages.drop(1),
-            budget = (maxContextTokens - (maxCompletionTokens ?: 0) - injectionTokens - quietTokens)
+            budget = (maxContextTokens - (maxCompletionTokens ?: 0) - injectionTokens - quietTokens - attachmentTokens)
                 .coerceAtLeast(0),
         )
         val budgetedMessages = if (rawGeneration) budgetedRaw.drop(1) else if (budgetedRaw.isEmpty()) budgetedRaw else {
@@ -421,15 +443,39 @@ class DefaultPromptEngine(
         // 12. Estimate token count for diagnostics
         val estimatedTokens = TokenBudget.estimateTotalTokens(finalMessages)
 
+        fun worldEntryTitle(entry: app.tellev.core.model.WorldBookEntry): String? = entry.comment.takeIf { it.isNotBlank() }
+        fun worldEntryBookName(entry: app.tellev.core.model.WorldBookEntry): String? =
+            worldBookNamesByEntryId[entry.id]?.takeIf { it.isNotBlank() }
+
         return PromptBuildResult(
             messages = finalMessages,
             stop = stopSequences,
-            maxTokens = maxCompletionTokens,
+            maxTokens = configuredMaxCompletionTokens,
             providerType = request.providerType,
             diagnostics = PromptDiagnostics(
                 activatedWorldEntryIds = activatedEntries.map { it.id },
                 estimatedTokenCount = estimatedTokens,
                 warnings = PromptPostProcessor.compatibilityWarnings(request) + promptTemplateResult.warnings,
+                worldBookHits = worldScanDiagnostics.hits.map { hit ->
+                    WorldEntryHit(
+                        entryId = hit.entry.id,
+                        title = worldEntryTitle(hit.entry),
+                        bookName = worldEntryBookName(hit.entry),
+                        matchedKeys = hit.matchedKeys,
+                        matchedSecondaryKeys = hit.matchedSecondaryKeys,
+                        unconditional = hit.unconditional,
+                        recursionLevel = hit.recursionLevel,
+                        tokens = hit.tokens,
+                    )
+                },
+                rejectedWorldEntries = worldScanDiagnostics.rejections.map { rejection ->
+                    WorldEntryRejection(
+                        entryId = rejection.entry.id,
+                        title = worldEntryTitle(rejection.entry),
+                        bookName = worldEntryBookName(rejection.entry),
+                        reason = rejection.reason,
+                    )
+                },
             ),
             promptTemplateVariableUpdates = promptTemplateResult.variableUpdates,
         )

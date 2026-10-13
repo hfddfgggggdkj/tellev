@@ -3,6 +3,7 @@ package app.tellev.core.provider
 import app.tellev.core.model.MessageRole
 import app.tellev.core.model.TellevError
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -28,6 +29,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 class OpenRouterAdapter(
     private val client: OkHttpClient = OkHttpClient(),
     private val json: Json = Json { ignoreUnknownKeys = true },
+    private val resolveAttachmentBytes: ((app.tellev.core.model.Attachment) -> ByteArray?)? = null,
 ) : CompletionSettingsAdapter {
     override val id: String = ProviderCatalog.OPENROUTER
     override val displayName: String = "OpenRouter"
@@ -39,7 +41,7 @@ class OpenRouterAdapter(
 
     override suspend fun checkStatus(config: ProviderConfig): ProviderStatus {
         val request = Request.Builder()
-            .url(config.baseUrl.trimEnd('/') + "/api/v1/models")
+            .url(apiV1Url(config, "/models"))
             .applyHeaders(config)
             .get()
             .build()
@@ -57,7 +59,7 @@ class OpenRouterAdapter(
 
     override suspend fun listModels(config: ProviderConfig): List<ProviderModel> {
         val request = Request.Builder()
-            .url(config.baseUrl.trimEnd('/') + "/api/v1/models")
+            .url(apiV1Url(config, "/models"))
             .applyHeaders(config)
             .get()
             .build()
@@ -79,12 +81,31 @@ class OpenRouterAdapter(
             put("stream", JsonPrimitive(request.stream))
             request.preset.temperature?.let { put("temperature", JsonPrimitive(it)) }
             request.preset.topP?.let { put("top_p", JsonPrimitive(it)) }
-            request.preset.maxTokens?.let { put("max_tokens", JsonPrimitive(it)) }
-            if (request.preset.stop.isNotEmpty()) {
-                put("stop", buildJsonArray { request.preset.stop.forEach { add(JsonPrimitive(it)) } })
+            // Engine-resolved budget: honor maxCompletionTokens, not just maxTokens.
+            // A preset that only sets one of the two must still reach the wire.
+            (request.prompt.maxTokens ?: request.preset.maxCompletionTokens ?: request.preset.maxTokens)
+                ?.let { put("max_tokens", JsonPrimitive(it)) }
+            if ((request.preset.stop + request.prompt.stop).isNotEmpty()) {
+                put("stop", buildJsonArray { (request.preset.stop + request.prompt.stop).distinct().forEach { add(JsonPrimitive(it)) } })
+            }
+            // Unified reasoning strength: Auto passes the preset's own
+            // reasoning field through; explicit levels map to reasoning.effort.
+            val reasoningInjection = ReasoningSupport.inject(
+                family = ReasoningFamily.OpenRouter,
+                effort = ReasoningSupport.effortFor(request),
+                raw = request.preset.raw,
+            )
+            if (reasoningInjection.resolved == app.tellev.core.model.ReasoningEffort.Auto) {
+                request.preset.raw["reasoning"]?.let { put("reasoning", it) }
+            } else {
+                reasoningInjection.fields["reasoning"]?.let { put("reasoning", it) }
             }
             put("messages", buildJsonArray {
-                request.prompt.messages.forEach { msg ->
+                // G6: declared Vision but never sent images. OpenRouter proxies
+                // the OpenAI shape — image_url content parts on the final user
+                // turn, mirroring OpenAiCompatibleAdapter.
+                val lastUserIndex = request.prompt.messages.indexOfLast { it.role == MessageRole.User }
+                request.prompt.messages.forEachIndexed { index, msg ->
                     add(buildJsonObject {
                         put("role", JsonPrimitive(when (msg.role) {
                             MessageRole.System -> "system"
@@ -92,7 +113,30 @@ class OpenRouterAdapter(
                             MessageRole.Assistant, MessageRole.Character -> "assistant"
                             MessageRole.Tool -> "tool"
                         }))
-                        put("content", JsonPrimitive(msg.content))
+                        val images = if (index == lastUserIndex) {
+                            request.attachments.filter { it.mimeType.startsWith("image/") }.mapNotNull { attachment ->
+                                val base64 = visionBase64(attachment) ?: return@mapNotNull null
+                                buildJsonObject {
+                                    put("type", JsonPrimitive("image_url"))
+                                    put("image_url", buildJsonObject {
+                                        put("url", JsonPrimitive("data:${attachment.mimeType};base64,$base64"))
+                                    })
+                                }
+                            }
+                        } else emptyList()
+                        if (images.isEmpty()) {
+                            put("content", JsonPrimitive(msg.content))
+                        } else {
+                            put("content", buildJsonArray {
+                                if (msg.content.isNotBlank()) {
+                                    add(buildJsonObject {
+                                        put("type", JsonPrimitive("text"))
+                                        put("text", JsonPrimitive(msg.content))
+                                    })
+                                }
+                                images.forEach { add(it) }
+                            })
+                        }
                         msg.name?.let { put("name", JsonPrimitive(it)) }
                         msg.wireFields?.forEach { (key, value) -> put(key, value) }
                     })
@@ -101,11 +145,18 @@ class OpenRouterAdapter(
         }
 
 
+    private fun visionBase64(attachment: app.tellev.core.model.Attachment): String? {
+        attachment.metadata["base64"]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }?.let { return it }
+        if (attachment.relativePath.isBlank()) return null
+        val bytes = resolveAttachmentBytes?.invoke(attachment) ?: return null
+        return java.util.Base64.getEncoder().encodeToString(bytes)
+    }
+
     override fun streamGenerate(config: ProviderConfig, request: GenerateRequest): Flow<GenerateChunk> = flow {
         val payload = request.completionSettings ?: completionPayload(config, request)
 
         val httpRequest = Request.Builder()
-            .url(config.baseUrl.trimEnd('/') + "/api/v1/chat/completions")
+            .url(apiV1Url(config, "/chat/completions"))
             .applyHeaders(config)
             .post(payload.toString().toRequestBody(JSON_TYPE))
             .build()
@@ -115,6 +166,7 @@ class OpenRouterAdapter(
         // 让阻塞中的 body 读立即抛错，而不是等到读超时（生产配置 5 分钟）。
         val callGuard = Job(coroutineContext[Job])
         callGuard.invokeOnCompletion { if (!call.isCanceled()) call.cancel() }
+        try {
         call.execute().use { response ->
             if (!response.isSuccessful) {
                 emit(GenerateChunk.Failed(TellevError(
@@ -154,6 +206,24 @@ class OpenRouterAdapter(
                 emit(GenerateChunk.Completed(text))
             }
         }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // A user stop closes the socket mid-read and surfaces as a generic
+            // IOException here. If the coroutine is cancelled this WAS a stop —
+            // rethrow as cancellation instead of flashing a bogus error banner.
+            coroutineContext.ensureActive()
+            emit(
+                GenerateChunk.Failed(
+                    TellevError(
+                        code = "provider_network",
+                        message = e.message ?: "Network error",
+                        retryable = true,
+                        causeType = e::class.simpleName,
+                    ),
+                ),
+            )
+        }
         callGuard.complete()
     }.flowOn(Dispatchers.IO)
 
@@ -163,6 +233,15 @@ class OpenRouterAdapter(
         header("HTTP-Referer", "https://tellev.app")
         header("X-Title", "Tellev")
         config.headers.forEach { (name, value) -> header(name, value) }
+    }
+
+    /** Accepts both `https://openrouter.ai` and the documented `https://openrouter.ai/api/v1`. */
+    private fun apiV1Url(config: ProviderConfig, suffix: String): String {
+        var base = config.baseUrl.trimEnd('/')
+        for (tail in listOf("/api/v1", "/api")) {
+            if (base.endsWith(tail, ignoreCase = true)) { base = base.dropLast(tail.length); break }
+        }
+        return "$base/api/v1$suffix"
     }
 
     private companion object {

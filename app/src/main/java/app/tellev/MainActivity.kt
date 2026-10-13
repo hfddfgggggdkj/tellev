@@ -18,17 +18,23 @@ import app.tellev.core.i18n.UiStrings
 import app.tellev.core.model.CharacterSummary
 import app.tellev.core.storage.CharacterImporter
 import app.tellev.util.UriUtils
-import app.tellev.ui.TellevRoot
-import app.tellev.ui.theme.TellevTheme
-import app.tellev.ui.theme.isDarkTheme
+import app.tellev.ui.dsh.DshRoot
+import app.tellev.ui.dsh.DshTheme
+import app.tellev.ui.dsh.isDarkTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.util.UUID
 
 class MainActivity : ComponentActivity() {
     private val graph: TellevGraph by lazy { TellevGraph.create(this) }
     private val characterImporter = CharacterImporter()
+
+    private companion object {
+        /** Import payload cap; see importCharacterFromUri. */
+        const val IMPORT_MAX_BYTES = 100L * 1024 * 1024
+    }
 
     override fun attachBaseContext(newBase: Context) {
         super.attachBaseContext(AppLocale.wrap(newBase))
@@ -41,12 +47,10 @@ class MainActivity : ComponentActivity() {
         setContent {
             CompositionLocalProvider(LocalTellevGraph provides graph) {
                 val themeMode by graph.themeModeFlow.collectAsState()
-                val themeAccent by graph.themeAccentFlow.collectAsState()
-                TellevTheme(
-                    darkTheme = themeMode.isDarkTheme(isSystemInDarkTheme()),
-                    accent = themeAccent,
-                ) {
-                    TellevRoot()
+                // 全应用只有一套 dsh（DeepSeek Harness）token 体系：
+                // 明暗由主题模式决定，不再有第二套强调色主题。
+                DshTheme(darkTheme = themeMode.isDarkTheme(isSystemInDarkTheme())) {
+                    DshRoot()
                 }
             }
         }
@@ -74,8 +78,23 @@ class MainActivity : ComponentActivity() {
     }
 
     private suspend fun importCharacterFromUri(uri: Uri): String {
-        val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
-            ?: error(getString(R.string.main_error_read_file))
+        // An external app can hand us an arbitrarily large VIEW/SEND payload
+        // (BROWSABLE intent → a web page can trigger it too). Reading it fully
+        // into memory unbounded turned "import" into an OOM kill switch; a card
+        // with an embedded 4MB cover is ~6MB, so 100MB is generous headroom.
+        val bytes = contentResolver.openInputStream(uri)?.use { input ->
+            val out = ByteArrayOutputStream()
+            val buffer = ByteArray(64 * 1024)
+            var total = 0
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                total += read
+                check(total <= IMPORT_MAX_BYTES) { getString(R.string.main_error_too_large) }
+                out.write(buffer, 0, read)
+            }
+            out.toByteArray()
+        } ?: error(getString(R.string.main_error_read_file))
         val fileName = UriUtils.resolveDisplayName(this, uri)
             ?: uri.lastPathSegment?.substringAfterLast('/')
             ?: "imported_character"
@@ -93,8 +112,14 @@ class MainActivity : ComponentActivity() {
 
     private fun Intent.importUri(): Uri? = when (action) {
         Intent.ACTION_VIEW -> data
-        @Suppress("DEPRECATION")
-        Intent.ACTION_SEND -> getParcelableExtra(Intent.EXTRA_STREAM)
+        // Type-safe overload arrived in API 33; minSdk 31 keeps the legacy path.
+        Intent.ACTION_SEND ->
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                getParcelableExtra(Intent.EXTRA_STREAM)
+            }
         else -> null
     }
 }

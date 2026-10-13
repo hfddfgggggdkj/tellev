@@ -40,7 +40,21 @@ interface StDataStore {
     suspend fun readCharacter(id: String): CharacterCard
     suspend fun saveCharacter(card: CharacterCard)
     suspend fun deleteCharacter(id: String)
-    suspend fun importCharacter(card: CharacterCard, sourceBytes: ByteArray, sourceFileName: String) {
+    /**
+     * Imports a card from [sourceBytes]. The card's embedded `character_book` is
+     * materialized but left disabled, so an import never binds a lorebook the
+     * user did not ask for; it can be switched on from the world-book screen.
+     *
+     * [bindEmbeddedWorldBook] is the opt-in for callers that build the card
+     * themselves (in-app creation) and want the generated book active straight
+     * away, matching what `saveCharacter` does.
+     */
+    suspend fun importCharacter(
+        card: CharacterCard,
+        sourceBytes: ByteArray,
+        sourceFileName: String,
+        bindEmbeddedWorldBook: Boolean = false,
+    ) {
         saveCharacter(card)
     }
 
@@ -59,7 +73,14 @@ interface StDataStore {
     suspend fun listChatSessionSummaries(characterId: String? = null, groupId: String? = null): List<ChatSessionSummary> =
         listChatSessions(characterId, groupId).map { it.toSummary() }
     suspend fun readChatSession(id: String): ChatSession
-    suspend fun saveChatSession(session: ChatSession)
+
+    /**
+     * Persist a whole session. When [expectedRevision] is given the write is a
+     * CAS against the journal revision read beforehand (M3): a concurrent writer
+     * that committed in between fails the save with "Stale write" instead of
+     * silently clobbering it.
+     */
+    suspend fun saveChatSession(session: ChatSession, expectedRevision: Long? = null)
 
     // Permanently remove a session: the JSONL, its gallery index, chat image files
     // under user/images, and the per-session background. No-op when the id is unknown.
@@ -92,6 +113,17 @@ interface StDataStore {
 
     suspend fun readWorldBook(id: String): WorldBook
     suspend fun saveWorldBook(book: WorldBook)
+
+    /**
+     * Persists an already-encoded world file verbatim under [id] (extension
+     * bridge saves). Default implementations write through the journaled
+     * path via [saveWorldBook]-equivalent storage; the intent is atomicity —
+     * never expose a raw writeText for user-visible data.
+     */
+    suspend fun saveWorldBookRawJson(id: String, data: kotlinx.serialization.json.JsonObject) {
+        error("当前存储实现不支持按原始 JSON 保存世界书")
+    }
+
     suspend fun importWorldBook(jsonBytes: ByteArray, sourceFileName: String): WorldBook {
         error("当前存储实现不支持导入世界书：$sourceFileName")
     }

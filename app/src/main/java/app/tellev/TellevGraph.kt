@@ -9,6 +9,7 @@ import app.tellev.core.extension.VariableStore
 import app.tellev.core.extension.EjsTemplateSettings
 import app.tellev.core.extension.TavernHelperSettings
 import app.tellev.core.extension.WebViewJsExtensionHost
+import app.tellev.core.network.CleartextGuard
 import app.tellev.core.prompt.DefaultMacroEngine
 import app.tellev.core.prompt.DefaultPromptEngine
 import app.tellev.core.prompt.MacroEngine
@@ -40,8 +41,7 @@ import app.tellev.core.storage.FileStDataStore
 import app.tellev.core.storage.StDataStore
 import app.tellev.core.storage.StDirectoryLayout
 import app.tellev.core.update.UpdateChecker
-import app.tellev.ui.theme.parseThemeAccent
-import app.tellev.ui.theme.parseThemeMode
+import app.tellev.ui.dsh.parseThemeMode
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -63,21 +63,17 @@ class TellevGraph private constructor(
     val extensionSettingsStore: ExtensionSettingsStore,
     val appPreferences: AppPreferences,
     val updateChecker: UpdateChecker,
+    /** Size-capped image download for URL-returning image engines (shared client policy). */
+    val imageDownloader: suspend (String) -> ByteArray?,
 ) {
     val importedCardSignal = MutableStateFlow(0L)
 
     /**
      * Current theme preference, mirrored into a StateFlow so MainActivity
-     * can recompose TellevTheme without reaching into SettingsViewModel.
+     * can recompose the app theme without reaching into SettingsViewModel.
      * Seeded from AppPreferences and updated by SettingsViewModel.setThemeMode.
      */
     val themeModeFlow = MutableStateFlow(parseThemeMode(appPreferences.themeModeName))
-
-    /**
-     * Current accent palette preference, mirrored the same way as
-     * [themeModeFlow] and updated by SettingsViewModel.setThemeAccent.
-     */
-    val themeAccentFlow = MutableStateFlow(parseThemeAccent(appPreferences.themeAccentName))
 
     /**
      * Chat bubble opacity preference, mirrored the same way as
@@ -116,6 +112,12 @@ class TellevGraph private constructor(
             val root = context.filesDir.toPath().resolve("st-data")
             val layout = StDirectoryLayout.fromRoot(root)
 
+            val appPreferences = AppPreferences(context)
+            // Cleartext policy is enforced in-app (CleartextGuard) so it can be
+            // an opt-in setting: loopback always allowed, other http:// hosts
+            // blocked until the user enables LAN cleartext in settings.
+            CleartextGuard.configure { appPreferences.allowRemoteCleartext }
+
             val macroEngine = DefaultMacroEngine()
             val templateEvaluator = app.tellev.core.prompt.WebViewTemplateEvaluator(context)
             val promptEngine = DefaultPromptEngine(macroEngine,
@@ -126,7 +128,11 @@ class TellevGraph private constructor(
             // for minutes, and OkHttp's default 10s read timeout kills those
             // streams mid-generation.
             val providerClient = OkHttpClient.Builder()
-                .connectTimeout(5, TimeUnit.MINUTES)
+                // A dead host (firewall DROP) used to hang the connect phase for
+                // the full 5 minutes; 15s is ample even for slow proxies. The
+                // long read/write timeouts stay for reasoning-model streams.
+                .addInterceptor(CleartextGuard)
+                .connectTimeout(15, TimeUnit.SECONDS)
                 .writeTimeout(5, TimeUnit.MINUTES)
                 .readTimeout(5, TimeUnit.MINUTES)
                 .callTimeout(0, TimeUnit.MILLISECONDS)
@@ -177,10 +183,10 @@ class TellevGraph private constructor(
                         chatCompletionsPath = "/chat/completions",
                         supportsModelListing = false,
                     ),
-                    AnthropicAdapter(client = providerClient),
+                    AnthropicAdapter(client = providerClient, resolveAttachmentBytes = resolveAttachmentBytes),
                     GeminiAdapter(client = providerClient, resolveAttachmentBytes = resolveAttachmentBytes),
-                    OpenRouterAdapter(client = providerClient),
-                    OllamaAdapter(client = providerClient),
+                    OpenRouterAdapter(client = providerClient, resolveAttachmentBytes = resolveAttachmentBytes),
+                    OllamaAdapter(client = providerClient, resolveAttachmentBytes = resolveAttachmentBytes),
                     KoboldAdapter(client = providerClient),
                     KoboldCppAdapter(client = providerClient),
                     NovelAiAdapter(client = providerClient),
@@ -202,9 +208,9 @@ class TellevGraph private constructor(
 
             // Update checker: short timeouts so a dead mirror is abandoned
             // quickly before falling back to the next one.
-            val appPreferences = AppPreferences(context)
             val updateChecker = UpdateChecker(
                 OkHttpClient.Builder()
+                    .addInterceptor(CleartextGuard)
                     .connectTimeout(8, TimeUnit.SECONDS)
                     .readTimeout(15, TimeUnit.SECONDS)
                     .build(),
@@ -270,6 +276,9 @@ class TellevGraph private constructor(
                 extensionSettingsStore = extensionSettingsStore,
                 appPreferences = appPreferences,
                 updateChecker = updateChecker,
+                imageDownloader = { url ->
+                    app.tellev.core.provider.ImageResultNormalizer.defaultUrlDownloader(providerClient, url)
+                },
             )
         }
     }

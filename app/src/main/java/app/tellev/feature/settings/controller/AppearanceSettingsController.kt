@@ -4,15 +4,13 @@ import app.tellev.core.i18n.S
 import app.tellev.core.i18n.UiStrings
 import app.tellev.core.storage.AppPreferences
 import app.tellev.feature.settings.SettingsUiState
-import app.tellev.ui.theme.ThemeAccent
-import app.tellev.ui.theme.ThemeMode
+import app.tellev.ui.dsh.ThemeMode
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
 
 internal class AppearanceSettingsController(
     private val appPreferences: AppPreferences,
     private val themeModeFlow: MutableStateFlow<ThemeMode>,
-    private val themeAccentFlow: MutableStateFlow<ThemeAccent>,
     private val chatBubbleAlphaFlow: MutableStateFlow<Float>,
     private val chatFontSizeSpFlow: MutableStateFlow<Int>,
     private val stateFlow: MutableStateFlow<SettingsUiState>,
@@ -28,14 +26,16 @@ internal class AppearanceSettingsController(
         }
     }
 
-    fun setThemeAccent(accent: ThemeAccent) {
-        appPreferences.themeAccentName = accent.name
-        themeAccentFlow.value = accent
+    /**
+     * Live-preview without persisting: slider drags call this on every tick so
+     * the bubble alpha updates across the app while dragging, and persist the
+     * final value once via [setChatBubbleAlpha] from onValueChangeFinished.
+     */
+    fun previewChatBubbleAlpha(alpha: Float) {
+        val coerced = alpha.coerceIn(0f, 1f)
+        chatBubbleAlphaFlow.value = coerced
         stateFlow.update {
-            it.copy(
-                themeAccent = accent,
-                info = UiStrings.get(S.setappctl_accent_switched, accent.displayName()),
-            )
+            it.copy(chatBubbleAlpha = coerced)
         }
     }
 
@@ -46,6 +46,13 @@ internal class AppearanceSettingsController(
         stateFlow.update {
             it.copy(chatBubbleAlpha = coerced)
         }
+    }
+
+    /** Same preview/persist split as [previewChatBubbleAlpha]. */
+    fun previewChatFontSizeSp(size: Int) {
+        val selected = size.coerceIn(14, 20)
+        chatFontSizeSpFlow.value = selected
+        stateFlow.update { it.copy(chatFontSizeSp = selected) }
     }
 
     fun setChatFontSizeSp(size: Int) {
@@ -68,10 +75,5 @@ internal class AppearanceSettingsController(
         ThemeMode.Light -> UiStrings.get(S.setappctl_theme_light)
         ThemeMode.Dark -> UiStrings.get(S.setappctl_theme_dark)
         ThemeMode.System -> UiStrings.get(S.setappctl_theme_system)
-    }
-
-    private fun ThemeAccent.displayName(): String = when (this) {
-        ThemeAccent.Warm -> UiStrings.get(S.setappctl_accent_warm)
-        ThemeAccent.Classic -> UiStrings.get(S.setappctl_accent_classic)
     }
 }

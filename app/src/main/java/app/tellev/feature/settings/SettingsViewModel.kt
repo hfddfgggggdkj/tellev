@@ -12,6 +12,7 @@ import app.tellev.core.model.Persona
 import app.tellev.core.model.PresetCategory
 import app.tellev.core.provider.ComfyUiSettings
 import app.tellev.core.provider.CustomProviderConfig
+import app.tellev.core.provider.ImageProviderProfile
 import app.tellev.core.provider.NovelAiImageSettings
 import app.tellev.core.provider.OpenAiCompatibilitySettings
 import app.tellev.core.provider.ProviderAdapter
@@ -22,6 +23,7 @@ import app.tellev.core.provider.ProviderRegistry
 import app.tellev.core.provider.ProviderStatus
 import app.tellev.core.provider.supportsChatGeneration
 import app.tellev.core.security.SecretStore
+import app.tellev.core.security.isInternalSecretId
 import app.tellev.core.storage.AppPreferences
 import app.tellev.core.storage.StDataStore
 import app.tellev.feature.settings.controller.AppearanceSettingsController
@@ -30,10 +32,8 @@ import app.tellev.feature.settings.controller.ImageGenSettingsController
 import app.tellev.feature.settings.controller.PersonaSecretSettingsController
 import app.tellev.feature.settings.controller.PresetSettingsController
 import app.tellev.feature.settings.controller.ProviderSettingsController
-import app.tellev.ui.theme.ThemeAccent
-import app.tellev.ui.theme.ThemeMode
-import app.tellev.ui.theme.parseThemeAccent
-import app.tellev.ui.theme.parseThemeMode
+import app.tellev.ui.dsh.ThemeMode
+import app.tellev.ui.dsh.parseThemeMode
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -50,6 +50,9 @@ data class SettingsUiState(
     val customConfigName: String = "",
     val baseUrl: String = "",
     val apiKey: String = "",
+    // 载入（或保存/切换）时的已存密钥快照：字段空白不等于「用户要删除密钥」，
+    // 可能只是读取失败回落；删除必须由用户在保存确认框里显式表态。
+    val loadedApiKey: String = "",
     val model: String = "",
     val compatibility: OpenAiCompatibilitySettings = OpenAiCompatibilitySettings(),
     val extraHeadersJson: String = "{}",
@@ -61,10 +64,10 @@ data class SettingsUiState(
     val personas: List<Persona> = emptyList(),
     val secretIds: List<String> = emptyList(),
     val themeMode: ThemeMode = ThemeMode.System,
-    val themeAccent: ThemeAccent = ThemeAccent.Warm,
     val chatBubbleAlpha: Float = 0.6f,
     val chatFontSizeSp: Int = 16,
     val languageTag: String = "",
+    val allowRemoteCleartext: Boolean = false,
     val isLoading: Boolean = false,
     val error: String? = null,
     val info: String? = null,
@@ -82,6 +85,10 @@ data class SettingsUiState(
     val novelAiSettings: NovelAiImageSettings = NovelAiImageSettings(),
     val novelAiStatus: ProviderStatus? = null,
     val isTestingNovelAi: Boolean = false,
+    // ── 自定义生图端口（OpenAI Images 兼容的多配置 profile）──
+    val imageProfiles: List<ImageProviderProfile> = emptyList(),
+    val isTestingImageProfile: Boolean = false,
+    val imageProfileStatus: ProviderStatus? = null,
 )
 
 class SettingsViewModel(
@@ -90,7 +97,6 @@ class SettingsViewModel(
     private val secretStore: SecretStore,
     private val appPreferences: AppPreferences,
     private val themeModeFlow: MutableStateFlow<ThemeMode>,
-    private val themeAccentFlow: MutableStateFlow<ThemeAccent>,
     private val chatBubbleAlphaFlow: MutableStateFlow<Float>,
     private val chatFontSizeSpFlow: MutableStateFlow<Int>,
 ) : ViewModel() {
@@ -133,7 +139,6 @@ class SettingsViewModel(
     private val appearanceController = AppearanceSettingsController(
         appPreferences = appPreferences,
         themeModeFlow = themeModeFlow,
-        themeAccentFlow = themeAccentFlow,
         chatBubbleAlphaFlow = chatBubbleAlphaFlow,
         chatFontSizeSpFlow = chatFontSizeSpFlow,
         stateFlow = _uiState,
@@ -148,6 +153,12 @@ class SettingsViewModel(
     init {
         observePresetChanges()
         loadInitialData()
+    }
+
+    /** 明文 HTTP 放行开关：关闭时仅允许本机（localhost/127.0.0.1）明文连接。 */
+    fun setAllowRemoteCleartext(enabled: Boolean) {
+        appPreferences.allowRemoteCleartext = enabled
+        _uiState.update { it.copy(allowRemoteCleartext = enabled) }
     }
 
     private fun observePresetChanges() {
@@ -179,7 +190,7 @@ class SettingsViewModel(
                     dataStore.readSelectedPresetName(category)?.let { category to it }
                 }.toMap()
                 val personas = dataStore.listPersonas()
-                val secretIds = secretStore.listSecretIds()
+                val secretIds = secretStore.listSecretIds().filterNot(::isInternalSecretId)
                 val storedSelectedId = secretStore.readSecret(ProviderDefaults.SELECTED_PROVIDER_SECRET_ID)
                     ?: _uiState.value.selectedProviderId
                 val selectedId = if (
@@ -201,6 +212,7 @@ class SettingsViewModel(
                 val comfyModel = secretStore.readSecret("provider-${ProviderCatalog.COMFYUI}-model") ?: ""
 
                 val imageEngine = ProviderConfigPersistence.loadImageEngine(secretStore)
+                val imageProfiles = ProviderConfigPersistence.listImageProviderProfiles(secretStore)
                 val novelAiSettings = ProviderConfigPersistence.loadNovelAiImageSettings(secretStore)
                 val novelAiToken =
                     secretStore.readSecret("provider-${ProviderCatalog.NOVELAI_IMAGE}-apikey") ?: ""
@@ -216,12 +228,13 @@ class SettingsViewModel(
                         personas = personas,
                         secretIds = secretIds,
                         themeMode = parseThemeMode(appPreferences.themeModeName),
-                        themeAccent = parseThemeAccent(appPreferences.themeAccentName),
                         chatBubbleAlpha = appPreferences.chatBubbleAlpha,
                         chatFontSizeSp = appPreferences.chatFontSizeSp,
                         languageTag = appPreferences.languageTag,
+                        allowRemoteCleartext = appPreferences.allowRemoteCleartext,
                         baseUrl = fields.baseUrl,
                         apiKey = fields.apiKey,
+                        loadedApiKey = fields.apiKey,
                         model = fields.model,
                         compatibility = fields.compatibility,
                         extraHeadersJson = json.encodeToString(fields.compatibility.headers),
@@ -231,6 +244,7 @@ class SettingsViewModel(
                         comfyModel = comfyModel,
                         comfySettings = comfySettings,
                         imageEngine = imageEngine,
+                        imageProfiles = imageProfiles,
                         novelAiToken = novelAiToken,
                         novelAiSettings = novelAiSettings,
                     )
@@ -270,7 +284,8 @@ class SettingsViewModel(
     fun createCustomConfig() = providerController.createCustomConfig()
     fun deleteCustomConfig(rawId: String) = providerController.deleteCustomConfig(rawId)
     fun testConnection() = providerController.testConnection()
-    fun saveProviderConfig() = providerController.saveProviderConfig()
+    fun saveProviderConfig(clearApiKey: Boolean = false) = providerController.saveProviderConfig(clearApiKey)
+    fun resetProviderConfig() = providerController.resetProviderConfig()
 
     // ── Image Generation Actions ──
 
@@ -284,6 +299,10 @@ class SettingsViewModel(
     fun updateNovelAiSettings(transform: (NovelAiImageSettings) -> NovelAiImageSettings) = imageGenController.updateNovelAiSettings(transform)
     fun testNovelAiImage() = imageGenController.testNovelAiImage()
     fun saveNovelAiImageConfig() = imageGenController.saveNovelAiImageConfig()
+    fun saveImageProfile(profile: ImageProviderProfile) = imageGenController.saveImageProfile(profile)
+    fun deleteImageProfile(profileId: String) = imageGenController.deleteImageProfile(profileId)
+    fun testImageProfile(profile: ImageProviderProfile) = imageGenController.testImageProfile(profile)
+    fun clearImageProfileStatus() = imageGenController.clearImageProfileStatus()
 
     // ── Preset Actions ──
 
@@ -307,8 +326,9 @@ class SettingsViewModel(
     // ── Appearance Actions ──
 
     fun setThemeMode(mode: ThemeMode) = appearanceController.setThemeMode(mode)
-    fun setThemeAccent(accent: ThemeAccent) = appearanceController.setThemeAccent(accent)
+    fun previewChatBubbleAlpha(alpha: Float) = appearanceController.previewChatBubbleAlpha(alpha)
     fun setChatBubbleAlpha(alpha: Float) = appearanceController.setChatBubbleAlpha(alpha)
+    fun previewChatFontSizeSp(size: Int) = appearanceController.previewChatFontSizeSp(size)
     fun setChatFontSizeSp(size: Int) = appearanceController.setChatFontSizeSp(size)
     fun setLanguage(tag: String) = appearanceController.setLanguage(tag)
 
@@ -334,7 +354,6 @@ class SettingsViewModelFactory(
     private val secretStore: SecretStore,
     private val appPreferences: AppPreferences,
     private val themeModeFlow: MutableStateFlow<ThemeMode>,
-    private val themeAccentFlow: MutableStateFlow<ThemeAccent>,
     private val chatBubbleAlphaFlow: MutableStateFlow<Float>,
     private val chatFontSizeSpFlow: MutableStateFlow<Int>,
 ) : ViewModelProvider.Factory {
@@ -347,8 +366,7 @@ class SettingsViewModelFactory(
                 secretStore = secretStore,
                 appPreferences = appPreferences,
                 themeModeFlow = themeModeFlow,
-                themeAccentFlow = themeAccentFlow,
-                chatBubbleAlphaFlow = chatBubbleAlphaFlow,
+                    chatBubbleAlphaFlow = chatBubbleAlphaFlow,
                 chatFontSizeSpFlow = chatFontSizeSpFlow,
             ) as T
         }

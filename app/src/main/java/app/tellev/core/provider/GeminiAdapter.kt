@@ -1,5 +1,7 @@
 package app.tellev.core.provider
 
+import app.tellev.core.i18n.S
+import app.tellev.core.i18n.UiStrings
 import app.tellev.core.model.MessageRole
 import app.tellev.core.model.TellevError
 import kotlinx.coroutines.Dispatchers
@@ -38,6 +40,15 @@ class GeminiAdapter(
         ProviderCapability.Streaming,
         ProviderCapability.Vision,
     )
+
+    override fun declaredContextWindow(config: ProviderConfig): Long? {
+        val model = config.model.orEmpty().lowercase()
+        return when {
+            "gemini-2.5-pro" in model || "gemini-3" in model -> 1_048_576L
+            "gemini" in model -> 1_048_576L
+            else -> null
+        }
+    }
 
     override suspend fun checkStatus(config: ProviderConfig): ProviderStatus {
         val model = config.model ?: "gemini-2.0-flash"
@@ -105,12 +116,23 @@ class GeminiAdapter(
                 request.preset.seed?.takeIf { it >= 0 }?.let { put("seed", JsonPrimitive(it)) }
                 request.preset.presencePenalty?.let { put("presencePenalty", JsonPrimitive(it)) }
                 request.preset.frequencyPenalty?.let { put("frequencyPenalty", JsonPrimitive(it)) }
-                if (request.preset.stop.isNotEmpty()) {
-                    put("stopSequences", buildJsonArray { request.preset.stop.forEach { add(JsonPrimitive(it)) } })
+                if ((request.preset.stop + request.prompt.stop).isNotEmpty()) {
+                    put("stopSequences", buildJsonArray { (request.preset.stop + request.prompt.stop).distinct().forEach { add(JsonPrimitive(it)) } })
                 }
                 request.preset.raw["responseMimeType"]?.let { put("responseMimeType", it) }
                 request.preset.raw["responseSchema"]?.let { put("responseSchema", it) }
-                request.preset.raw["thinkingConfig"]?.let { put("thinkingConfig", it) }
+                // Unified reasoning strength: Auto keeps the preset's own
+                // thinkingConfig verbatim; explicit levels map to a thinkingBudget.
+                val reasoningInjection = ReasoningSupport.inject(
+                    family = ReasoningFamily.Gemini,
+                    effort = ReasoningSupport.effortFor(request),
+                    raw = request.preset.raw,
+                )
+                if (reasoningInjection.resolved == app.tellev.core.model.ReasoningEffort.Auto) {
+                    request.preset.raw["thinkingConfig"]?.let { put("thinkingConfig", it) }
+                } else {
+                    reasoningInjection.fields["thinkingConfig"]?.let { put("thinkingConfig", it) }
+                }
                 (request.preset.raw["generationConfigExtra"] as? JsonObject)?.forEach { (key, value) -> put(key, value) }
             })
             request.preset.raw["safetySettings"]?.let { put("safetySettings", it) }
@@ -151,6 +173,7 @@ class GeminiAdapter(
                     var finishReason: String? = null
                     var usage: JsonObject? = null
                     var safetyBlock: String? = null
+                    var dataFrames = 0
                     val toolCalls = mutableListOf<JsonObject>()
                     while (source != null && !source.exhausted()) {
                         coroutineContext.ensureActive()
@@ -158,6 +181,7 @@ class GeminiAdapter(
                         if (!line.startsWith("data:")) continue
                         val data = line.removePrefix("data:").trim()
                         if (data.isEmpty()) continue
+                        dataFrames++
                         val parsed = parseGeminiResponse(data)
                         if (parsed.text.isNotEmpty()) {
                             fullText += parsed.text
@@ -169,6 +193,19 @@ class GeminiAdapter(
                         parsed.usage?.let { usage = it }
                         parsed.safetyBlock?.let { safetyBlock = it }
                         toolCalls += parsed.toolCalls
+                    }
+                    // A stream that ends without a finishReason was truncated
+                    // mid-generation; saving it as a complete turn silently
+                    // loses the rest of the answer. Same guard as the
+                    // OpenAI/Ollama adapters (opt-in via require_stream_terminator).
+                    if (request.metadata["require_stream_terminator"]?.jsonPrimitive?.contentOrNull == "true" &&
+                        dataFrames > 0 && finishReason == null && safetyBlock == null
+                    ) {
+                        emit(GenerateChunk.Failed(TellevError(
+                            code = "provider_incomplete_stream",
+                            message = UiStrings.get(S.oai_error_stream_incomplete, dataFrames),
+                        )))
+                        return@use
                     }
                     if (fullText.isEmpty() && reasoningText.isEmpty() && safetyBlock != null) {
                         emit(GenerateChunk.Failed(TellevError("gemini_safety", safetyBlock!!, retryable = false)))

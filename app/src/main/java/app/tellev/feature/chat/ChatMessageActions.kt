@@ -146,67 +146,6 @@ internal class ChatMessageActions(
         sessionRuntime.scheduleMetadataSave(session, updatedSession, onSessionUpdated)
         return true
     }
-
-    suspend fun setChatMessageFromExtension(
-        index: Int,
-        field: String,
-        value: String,
-        state: ChatUiState,
-        onSessionUpdated: (ChatSession) -> Unit,
-    ): Boolean {
-        val session = state.currentSession ?: return false
-        val messages = state.messages.toMutableList()
-        if (index !in messages.indices) return false
-
-        val original = messages[index]
-        val updated = when (field.lowercase()) {
-            "message", "mes" -> original.withContent(value)
-            "name" -> original.copy(name = value)
-            "role" -> {
-                val newRole = when (value.lowercase()) {
-                    "user" -> MessageRole.User
-                    "assistant" -> MessageRole.Assistant
-                    "system" -> MessageRole.System
-                    "character" -> MessageRole.Character
-                    else -> original.role
-                }
-                original.copy(role = newRole)
-            }
-            "is_hidden" -> original.copy(isHidden = value.toBooleanStrictOrNull() ?: original.isHidden)
-            "data" -> {
-                val parsed = runCatching { Json.parseToJsonElement(value) as? JsonObject }.getOrNull()
-                    ?: return false
-                val vars = original.variables.toMutableList()
-                while (vars.size <= original.swipeIndex) vars.add(buildJsonObject { })
-                vars[original.swipeIndex] = parsed
-                original.copy(variables = vars)
-            }
-            "swipe_id" -> {
-                val swipes = original.swipes.ifEmpty { listOf(original.content) }
-                val swipeIndex = value.toIntOrNull()?.coerceIn(0, swipes.lastIndex) ?: original.swipeIndex
-                original.copy(
-                    swipeIndex = swipeIndex,
-                    swipes = swipes,
-                    content = swipes[swipeIndex],
-                )
-            }
-            "extra" -> {
-                val parsed = runCatching { Json.parseToJsonElement(value) as? JsonObject }.getOrNull()
-                original.copy(metadata = parsed ?: original.metadata)
-            }
-            else -> original.copy(
-                metadata = buildJsonObject {
-                    original.metadata.forEach { (key, element) -> put(key, element) }
-                    put(field, value)
-                },
-            )
-        }
-
-        messages[index] = updated
-        val updatedSession = session.copy(messages = messages)
-        sessionRuntime.persistSessionMutation(session, updatedSession, onSessionUpdated)
-        return true
-    }
 }
 
 internal fun ChatMessage.withContent(value: String): ChatMessage {
@@ -240,9 +179,19 @@ internal fun editedChatMessage(message: ChatMessage, content: String): ChatMessa
 }
 
 internal fun visibleRegexDepth(messages: List<ChatMessage>, messageIndex: Int): Int =
-    messages.drop(messageIndex + 1).count {
-        !it.isHidden && it.role != MessageRole.System && it.role != MessageRole.Tool
+    visibleRegexDepths(messages).getOrElse(messageIndex) { 0 }
+
+/** One reverse pass replaces [visibleRegexDepth]'s O(n) per item (Q12). */
+internal fun visibleRegexDepths(messages: List<ChatMessage>): IntArray {
+    val depths = IntArray(messages.size)
+    var visibleAfter = 0
+    for (index in messages.indices.reversed()) {
+        depths[index] = visibleAfter
+        val message = messages[index]
+        if (!message.isHidden && message.role != MessageRole.System && message.role != MessageRole.Tool) visibleAfter++
     }
+    return depths
+}
 
 internal fun ChatMessage.withRegeneratedSwipe(newContent: String): ChatMessage {
     val previousSwipes = swipes.ifEmpty { listOf(content) }
@@ -251,4 +200,17 @@ internal fun ChatMessage.withRegeneratedSwipe(newContent: String): ChatMessage {
         swipes = previousSwipes + newContent,
         swipeIndex = previousSwipes.size,
     )
+}
+
+/**
+ * 继续生成：把 [addition] 拼到当前 swipe 的内容后面（不新开 swipe）。
+ * 中断时传的是部分文本，语义相同。
+ */
+internal fun ChatMessage.withContinuedText(addition: String): ChatMessage {
+    if (addition.isEmpty()) return this
+    val appended = content + addition
+    val swipes = swipes.ifEmpty { listOf(content) }.toMutableList()
+    val index = if (swipeIndex in swipes.indices) swipeIndex else swipes.lastIndex
+    swipes[index] = appended
+    return copy(content = appended, swipes = swipes, swipeIndex = index)
 }

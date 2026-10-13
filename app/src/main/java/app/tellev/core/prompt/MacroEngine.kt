@@ -307,17 +307,16 @@ class DefaultMacroEngine : MacroEngine {
         val trimmed = rangeSpec.trim()
         return if (trimmed.contains("-")) {
             val parts = trimmed.split("-", limit = 2)
-            val low = parts[0].trim().toIntOrNull() ?: 0
-            val high = parts[1].trim().toIntOrNull() ?: 0
-            if (low <= high) {
-                Random.nextInt(low, high + 1).toString()
-            } else {
-                Random.nextInt(high, low + 1).toString()
-            }
+            val low = parts[0].trim().toLongOrNull() ?: 0L
+            val high = parts[1].trim().toLongOrNull() ?: 0L
+            val (from, to) = if (low <= high) low to high else high to low
+            // Long bounds: `high + 1` on Int.MAX_VALUE wrapped negative and
+            // Random.nextInt threw on the empty range.
+            Random.nextLong(from, to + 1).toString()
         } else {
-            val max = trimmed.toIntOrNull()
+            val max = trimmed.toLongOrNull()
             when {
-                max != null && max > 0 -> Random.nextInt(0, max).toString()
+                max != null && max > 0 -> Random.nextLong(0, max).toString()
                 max != null -> "0"
                 // ST semantics: a non-numeric spec is a single-item list and
                 // comes back unchanged (macros.js:492-509).
@@ -607,22 +606,36 @@ class DefaultMacroEngine : MacroEngine {
         value.isEmpty() || value == "0" || value.equals("false", ignoreCase = true) || value == "null"
 
     private fun compareEq(a: String, b: String): String {
+        // ST comparisons run through JS Number(): "1.0" == "1", "007" == "7",
+        // "1e3" == "1000". Exact long compare stays the fast path so huge
+        // integers never lose precision through doubles.
         val la = a.toLongOrNull()
         val lb = b.toLongOrNull()
-        val equal = if (la != null && lb != null) la == lb else a == b
+        val equal = when {
+            la != null && lb != null -> la == lb
+            a == b -> true
+            a.toDoubleOrNull() != null && b.toDoubleOrNull() != null -> a.toDouble() == b.toDouble()
+            else -> false
+        }
         return if (equal) "true" else "false"
     }
 
     /**
-     * Ordered comparison. Numeric when both sides parse as Long; lexicographic
-     * when neither does; mixed (one numeric, one not) is not comparable → false.
+     * Ordered comparison. Numeric when both sides parse as Long (exact), then
+     * as Double (JS Number semantics cover "1.0" vs "1"); lexicographic when
+     * neither does; mixed (one numeric, one not) is not comparable → false.
      */
     private fun compareCmp(a: String, b: String, op: String): String {
         val la = a.toLongOrNull()
         val lb = b.toLongOrNull()
+        val da = a.toDoubleOrNull()
+        val db = b.toDoubleOrNull()
         val result = when {
             la != null && lb != null -> when (op) {
                 ">=" -> la >= lb; "<=" -> la <= lb; ">" -> la > lb; "<" -> la < lb; else -> false
+            }
+            da != null && db != null -> when (op) {
+                ">=" -> da >= db; "<=" -> da <= db; ">" -> da > db; "<" -> da < db; else -> false
             }
             la == null && lb == null -> {
                 val c = a.compareTo(b)
@@ -651,17 +664,22 @@ class DefaultMacroEngine : MacroEngine {
     }
 
     private fun resolveRoll(spec: String): String {
-        // Supports: `d20`, `1d20`, `3d6`, `3d6+4`, `6` (bare count = 1dN).
+        // Supports: `d20`, `1d20`, `3d6`, `3d6+4`, `d%` (ST shorthand for d100),
+        // `6` (bare count = 1dN). Card text drives this, so every number is
+        // parsed overflow-safely and bounded: `1d0` used to throw on an empty
+        // Random range, `d99999999999` on toInt(), and `2000000000d6` stalled
+        // the prompt build for minutes.
         val trimmed = spec.trim()
-        val dice = Regex("""^(\d*)d(\d+)([+-]\d+)?$""", RegexOption.IGNORE_CASE)
+        val dice = Regex("""^(\d*)d(\d+|%)([+-]\d+)?$""", RegexOption.IGNORE_CASE)
         val bare = trimmed.toIntOrNull()
         return when {
             dice.matches(trimmed) -> {
                 val g = dice.find(trimmed)!!.groupValues
-                val count = g[1].ifEmpty { "1" }.toInt()
-                val sides = g[2].toInt()
-                val mod = g[3].ifEmpty { "0" }.toInt()
-                var total = 0
+                val count = (g[1].ifEmpty { "1" }.toLongOrNull() ?: MAX_DICE).coerceIn(0L, MAX_DICE).toInt()
+                val sides = if (g[2] == "%") 100 else (g[2].toLongOrNull() ?: 0L).coerceAtMost(MAX_DICE_SIDES).toInt()
+                val mod = g[3].ifEmpty { "0" }.toLongOrNull()?.coerceIn(-MAX_DICE_SIDES, MAX_DICE_SIDES) ?: 0L
+                if (sides < 1) return "0"
+                var total = 0L
                 repeat(count) { total += Random.nextInt(1, sides + 1) }
                 (total + mod).toString()
             }
@@ -675,15 +693,21 @@ class DefaultMacroEngine : MacroEngine {
             expression == "newline" -> "\n"
             expression.startsWith("newline::") -> {
                 val n = expression.removePrefix("newline::").trim().toIntOrNull() ?: 1
-                "\n".repeat(n.coerceAtLeast(0))
+                "\n".repeat(n.coerceIn(0, MAX_REPEAT))
             }
             expression == "space" -> " "
             expression.startsWith("space::") -> {
                 val n = expression.removePrefix("space::").trim().toIntOrNull() ?: 1
-                " ".repeat(n.coerceAtLeast(0))
+                " ".repeat(n.coerceIn(0, MAX_REPEAT))
             }
             expression == "noop" -> ""
             else -> null
         }
+    }
+
+    private companion object {
+        const val MAX_DICE = 1000L
+        const val MAX_DICE_SIDES = 1_000_000L
+        const val MAX_REPEAT = 1000
     }
 }

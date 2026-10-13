@@ -16,20 +16,26 @@ class TavernMessageCompatTest {
     @Test
     fun `streaming frontend keeps reading position by deferring reload until following resumes`() {
         val tracker = TavernMessageLoadTracker()
-        assertTrue(tracker.shouldLoad("first", allowUpdates = false))
-        assertFalse(tracker.shouldLoad("second", allowUpdates = false))
-        assertFalse(tracker.shouldLoad("third", allowUpdates = false))
-        assertTrue(tracker.shouldLoad("third", allowUpdates = true))
-        assertFalse(tracker.shouldLoad("third", allowUpdates = true))
+        assertTrue(tracker.shouldLoad("first", allowUpdates = false, nowMs = 0))
+        assertFalse(tracker.shouldLoad("second", allowUpdates = false, nowMs = 10))
+        assertFalse(tracker.shouldLoad("third", allowUpdates = false, nowMs = 20))
+        // Updates resume after the user re-follows; the reload coalescer still
+        // applies (≥160ms since the last accepted load).
+        assertFalse(tracker.shouldLoad("third", allowUpdates = true, nowMs = 100))
+        assertTrue(tracker.shouldLoad("third", allowUpdates = true, nowMs = 200))
+        assertFalse(tracker.shouldLoad("third", allowUpdates = true, nowMs = 300))
     }
 
     @Test
     fun `message webview reloads only when rendered html changes`() {
         val tracker = TavernMessageLoadTracker()
 
-        assertTrue(tracker.shouldLoad("<html>first</html>"))
-        assertTrue(!tracker.shouldLoad("<html>first</html>"))
-        assertTrue(tracker.shouldLoad("<html>second</html>"))
+        assertTrue(tracker.shouldLoad("<html>first</html>", nowMs = 0))
+        assertTrue(!tracker.shouldLoad("<html>first</html>", nowMs = 50))
+        // Changed html inside the coalescing window is skipped: the finished
+        // message always gets its own fresh bubble with the complete text.
+        assertTrue(!tracker.shouldLoad("<html>second</html>", nowMs = 100))
+        assertTrue(tracker.shouldLoad("<html>second</html>", nowMs = 200))
     }
 
     @Test
@@ -225,7 +231,7 @@ class TavernMessageCompatTest {
         assertTrue(script.contains("setTimeout(postHeightNow, 150)"))
         // 差值门限：1px 级抖动不进主线程消息队列。
         assertTrue(script.contains("lastPostedHeight"))
-        assertTrue(script.contains("Math.abs(h - lastPostedHeight) < 2"))
+        assertTrue(script.contains("Math.abs(h - lastPostedHeight) * (window.devicePixelRatio || 1) < 2"))
     }
 
     @Test
@@ -248,7 +254,8 @@ class TavernMessageCompatTest {
 
         assertTrue(script.contains("window.scrollTo(0, 0)"))
         assertTrue(script.contains("hasOversizedFlowChild"))
-        assertTrue(script.contains("justify-content', 'flex-start"))
+        assertTrue(script.contains("bodyStyle.flexDirection"))
+        assertTrue(script.contains("align-items', 'flex-start"))
         assertTrue(script.contains("findNestedScrollOwner"))
         assertTrue(script.contains("overflowY === 'auto' || overflowY === 'scroll'"))
         assertTrue(script.contains("TellevBridge.setNestedScrollGesture(!!owner)"))
@@ -262,7 +269,7 @@ class TavernMessageCompatTest {
         assertFalse(script.contains("overflow-y: visible !important"))
         assertTrue(script.contains("document.fonts.ready"))
         assertTrue(script.contains("nativeViewportHeight = 462"))
-        assertTrue(script.contains("nativeViewportHeight > 0"))
+        assertTrue(script.contains("window.__tellevNativeViewportHeight > 0"))
         assertTrue(script.contains("new MutationObserver(resetMessageViewport)"))
         assertTrue(script.contains("setTimeout(resetMessageViewport, 1000)"))
     }

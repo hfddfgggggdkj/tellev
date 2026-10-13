@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.ExtensionOff
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -59,12 +60,12 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import app.tellev.R
-import app.tellev.ui.AtmosphereIntro
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ExtensionsScreen(
     viewModel: ExtensionsViewModel,
+    onBack: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -90,6 +91,17 @@ fun ExtensionsScreen(
         topBar = {
             TopAppBar(
                 title = { Text(stringResource(R.string.ext_title)) },
+                navigationIcon = {
+                    // 从设置进入时提供返回；独立打开（无 onBack）时隐藏。
+                    if (onBack != null) {
+                        IconButton(onClick = onBack) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = stringResource(R.string.chars_back_cd),
+                            )
+                        }
+                    }
+                },
                 actions = {
                     IconButton(onClick = { viewModel.refreshExtensions() }) {
                         Icon(Icons.Default.Refresh, contentDescription = stringResource(R.string.ext_refresh_cd))
@@ -119,13 +131,6 @@ fun ExtensionsScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
                 contentPadding = PaddingValues(16.dp),
             ) {
-                item(key = "extensions_intro") {
-                    AtmosphereIntro(
-                        title = stringResource(R.string.ui_extensions_intro),
-                        subtitle = stringResource(R.string.ui_extensions_intro_hint),
-                        icon = Icons.Default.Extension,
-                    )
-                }
                 item(key = "memory_module") { MemoryExtensionCard() }
 
                 item(key = "built_in_header") {
@@ -218,10 +223,19 @@ fun ExtensionsScreen(
                 logs = logs,
                 promptSnapshot = state.runtime.promptDebugSnapshot,
                 showPromptDiagnostics = target == "ejs-template-compat",
+                apiStats = state.runtime.statsByExtensionId[target].orEmpty(),
+                recentCalls = state.runtime.recentCallsByExtensionId[target].orEmpty(),
+                errors = state.runtime.errors.filter { it.extensionId == target },
+                declaredPermissions = state.runtime.declaredPermissionsByExtensionId[target].orEmpty(),
+                grantedPermissions = state.runtime.grantedPermissionsByExtensionId[target].orEmpty(),
+                onTogglePermission = { permission, granted ->
+                    viewModel.toggleExtensionPermission(target, permission, granted)
+                },
                 onClearLogs = {
                     viewModel.clearRuntimeLogs(if (showAllRuntimeLogs) null else target)
                 },
                 onClearPromptSnapshot = { viewModel.clearPromptDebugSnapshot() },
+                onClearStats = { viewModel.clearExtensionStats(target) },
                 onClose = { viewModel.closeDebug() },
             )
         }

@@ -9,4 +9,17 @@ captures/
 *.iml
 backup-*/
 .keystore/
+.archive/
 
+nul
+
+# Signing material (plaintext passwords) must never be tracked.
+keystore.properties
+*.jks
+*.keystore
+
+# ZCode session artifacts
+.zcode/
+
+# 本地打包产物（APK/源码 zip），不入库
+dist/

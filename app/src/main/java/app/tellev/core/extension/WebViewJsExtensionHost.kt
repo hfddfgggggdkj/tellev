@@ -9,8 +9,13 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import app.tellev.core.extension.ExtensionErrorRecord
+import app.tellev.core.extension.host.ExtensionApiStat
+import app.tellev.core.extension.host.ExtensionRecentCall
+import app.tellev.core.extension.host.ExtensionStatsCollector
 import app.tellev.core.extension.host.ExtensionDiagnostics
 import app.tellev.core.extension.host.ExtensionPromptStore
 import app.tellev.core.extension.host.ExtensionRequestManager
@@ -21,13 +26,17 @@ import app.tellev.core.prompt.DefaultMacroEngine
 import app.tellev.core.prompt.MacroContext
 import app.tellev.core.prompt.MacroEngine
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
@@ -41,6 +50,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
+import java.io.ByteArrayInputStream
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -91,11 +101,22 @@ class WebViewJsExtensionHost(
     }
     private val capabilityTokens = ConcurrentHashMap<String, String>()
     private val declaredPermissions = ConcurrentHashMap<String, Set<ExtensionPermission>>()
+
+    /**
+     * Snapshot of [ExtensionPermissionManager.hasPermission] for Network, taken
+     * while the extension loads. [WebViewClient.shouldInterceptRequest] runs on
+     * a WebView thread and cannot suspend into the permission manager, so the
+     * WebView consults this snapshot instead; a grant/revoke made mid-session
+     * takes effect on the extension's next (re)load, which also rebuilds the
+     * runtime WebView.
+     */
+    private val networkFetchGranted = ConcurrentHashMap<String, Boolean>()
     private val slashCommands = ConcurrentHashMap<String, RegisteredCommand>()
     private val virtualRoutes = ConcurrentHashMap<String, RegisteredRoute>()
 
     private val requests = ExtensionRequestManager()
     private val diagnostics = ExtensionDiagnostics()
+    private val statsCollector = ExtensionStatsCollector()
     private val promptStore = ExtensionPromptStore()
 
     private val settingsCache = ConcurrentHashMap<String, String>()
@@ -226,13 +247,23 @@ class WebViewJsExtensionHost(
             val handle =
                 withContext(Dispatchers.Main) {
                     webViews.remove(manifest.id)?.let(::destroyRuntimeWebView)
-                    requests.pendingLoads.remove(manifest.id)?.cancel()
-                    requests.pendingLoadFailures.remove(manifest.id)
+                    // A superseded load destroys the old WebView, so its in-flight
+                    // evaluations/commands/API calls can never complete. Cancel them
+                    // here (awaitPending normalizes to a timeout-style result);
+                    // leaving them pending used to stall awaiters 10-30s each.
+                    requests.cancelPendingForExtension(manifest.id)
 
                     capabilityTokens[manifest.id] = token
                     declaredPermissions[manifest.id] = manifest.permissions
+                    networkFetchGranted[manifest.id] =
+                        permissionManager.hasPermission(manifest.id, ExtensionPermission.Network)
                     requests.pendingLoads[manifest.id] = readySignal
 
+                    // A previous saveSettings failure used to poison this id for
+                    // the whole process ("需要恢复" with no recovery path). A fresh
+                    // load re-reads persisted state anyway, so the stale failure
+                    // marker can go — the next save retries cleanly.
+                    synchronized(settingsWriteLock) { settingsFailures.remove(manifest.id) }
                     val settingsJson = settingsStore.getSettings(manifest.id)
                     settingsCache[manifest.id] = json.encodeToString(JsonObject.serializer(), settingsJson)
 
@@ -253,18 +284,56 @@ class WebViewJsExtensionHost(
                         settings.javaScriptEnabled = true
                         settings.allowFileAccess = false
                         settings.allowContentAccess = false
+                        // Deprecated in API 30 (default false), pinned defensively:
+                        // card module pages must never read local files.
+                        @Suppress("DEPRECATION")
                         settings.allowFileAccessFromFileURLs = false
+                        @Suppress("DEPRECATION")
                         settings.allowUniversalAccessFromFileURLs = false
                         // Character modules use localStorage at module evaluation time.
                         // Each extension has a distinct HTTPS origin (see extensionBaseUrl).
                         settings.domStorageEnabled = true
-                        settings.databaseEnabled = false
                         settings.javaScriptCanOpenWindowsAutomatically = false
                         settings.setSupportMultipleWindows(false)
 
                         webViewClient = object : WebViewClient() {
-                            override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
-                                CompatAssets.intercept(context, request.url.toString())
+                            override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                                val url = request.url.toString()
+                                CompatAssets.intercept(context, url)?.let { return it }
+                                // Subresources bypass shouldOverrideUrlLoading, so the
+                                // navigation origin-lock alone never sees fetch/XHR.
+                                // Cross-origin requests need the Network permission.
+                                if (!isAllowedExtensionSubresource(manifest.id, url, networkFetchGranted[manifest.id] == true)) {
+                                    reportExtensionLog(
+                                        manifest.id,
+                                        "warning",
+                                        "Blocked module request to $url",
+                                    )
+                                    return WebResourceResponse(
+                                        "text/plain", "UTF-8", 403, "Blocked",
+                                        emptyMap<String, String>(),
+                                        ByteArrayInputStream(ByteArray(0)),
+                                    )
+                                }
+                                return null
+                            }
+
+                            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                                // Renderer crash (typically OOM inside the WebView
+                                // process). The platform default KILLS the whole app;
+                                // handled instead: drop the dead runtime, release all
+                                // its awaiters, report, and let the next load rebuild.
+                                if (webViews[manifest.id] === view) {
+                                    webViews.remove(manifest.id)
+                                    destroyRuntimeWebView(view)
+                                    requests.cancelPendingForExtension(manifest.id)
+                                    reportExtensionError(
+                                        manifest.id,
+                                        if (detail.didCrash()) "WebView renderer crashed" else "WebView renderer killed by system",
+                                    )
+                                }
+                                return true
+                            }
 
                             override fun shouldOverrideUrlLoading(
                                 view: WebView,
@@ -298,7 +367,9 @@ class WebViewJsExtensionHost(
                         webChromeClient = object : WebChromeClient() {
                             override fun onConsoleMessage(message: ConsoleMessage): Boolean {
                                 val level = if (message.messageLevel() == ConsoleMessage.MessageLevel.ERROR) "error" else "debug"
-                                reportExtensionLog(manifest.id, level, "${message.message()} (${message.sourceId()}:${message.lineNumber()})")
+                                val text = "${message.message()} (${message.sourceId()}:${message.lineNumber()})"
+                                if (level == "error") reportExtensionError(manifest.id, text)
+                                else reportExtensionLog(manifest.id, level, text)
                                 return true
                             }
                         }
@@ -365,6 +436,7 @@ class WebViewJsExtensionHost(
                 if (capabilityTokens.remove(manifest.id, token)) {
                     webViews.remove(manifest.id)?.let(::destroyRuntimeWebView)
                     declaredPermissions.remove(manifest.id)
+                    networkFetchGranted.remove(manifest.id)
                     settingsCache.remove(manifest.id)
                     slashCommands.entries.removeIf { it.value.extensionId == manifest.id }
                     virtualRoutes.entries.removeIf { it.value.extensionId == manifest.id }
@@ -381,6 +453,7 @@ class WebViewJsExtensionHost(
             // resuming off-main here used to let an old unload clear a new load.
             capabilityTokens.remove(extensionId)
             declaredPermissions.remove(extensionId)
+            networkFetchGranted.remove(extensionId)
             settingsCache.remove(extensionId)
             slashCommands.entries.removeIf { it.value.extensionId == extensionId }
             virtualRoutes.entries.removeIf { it.value.extensionId == extensionId }
@@ -412,7 +485,8 @@ class WebViewJsExtensionHost(
             extensionIds = webViews.keys.toList(),
             excludeExtensionId = excludeExtensionId,
             dispatch = { id ->
-                evaluateRuntime(id, "window.__tellevDispatch(" + JsonPrimitive(event.name) + "," + JsonPrimitive(payload) + ")")
+                evaluateRuntime(id, "window.__tellevDispatch(" + ExtensionScriptTemplate.jsExpression(JsonPrimitive(event.name).toString()) +
+                    "," + ExtensionScriptTemplate.jsExpression(JsonPrimitive(payload).toString()) + ")")
             },
             onFailure = { id, failure ->
                 android.util.Log.w("tellev-ext", "Event dispatch to $id failed: ${failure.message}")
@@ -427,8 +501,9 @@ class WebViewJsExtensionHost(
             extensionIds = webViews.keys.toList(),
             excludeExtensionId = null,
             dispatch = { id ->
-                val result = evaluateRuntime(id, "window.__tellevDispatch(" + JsonPrimitive(event.name) +
-                    "," + JsonPrimitive(payload.toString()) + ")")
+                val result = evaluateRuntime(id, "window.__tellevDispatch(" +
+                    ExtensionScriptTemplate.jsExpression(JsonPrimitive(event.name).toString()) + "," +
+                    ExtensionScriptTemplate.jsExpression(JsonPrimitive(payload.toString()).toString()) + ")")
                 val updated = json.parseToJsonElement(result) as? JsonObject
                     ?: error("Mutable event returned no payload: ${event.name}")
                 require(updated["args"] is JsonArray) { "Mutable event lost its arguments: ${event.name}" }
@@ -440,6 +515,20 @@ class WebViewJsExtensionHost(
         )
         return payload
     }
+
+    /**
+     * Awaits a pending request, normalizing an EXTERNAL cancellation of the
+     * deferred (superseded extension load, destroyed WebView, renderer crash)
+     * to a null — callers map null to their timeout result. A cancellation of
+     * the caller's own coroutine still propagates.
+     */
+    private suspend fun <T> awaitPending(deferred: CompletableDeferred<T>): T? =
+        try {
+            deferred.await()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            kotlin.coroutines.coroutineContext.ensureActive()
+            null
+        }
 
     suspend fun evaluateRuntime(extensionId: String, expression: String): String {
         val id = UUID.randomUUID().toString()
@@ -453,7 +542,7 @@ class WebViewJsExtensionHost(
                     "v=>tellevNative.evaluationDone('$id',true,JSON.stringify(v??null))," +
                     "e=>tellevNative.evaluationDone('$id',false,String(e.stack||e)))", null)
             }
-            return withTimeoutOrNull(apiCallTimeoutMs) { result.await() }
+            return withTimeoutOrNull(apiCallTimeoutMs) { awaitPending(result) }
                 ?: error("Runtime operation timed out: $extensionId")
         } finally {
             requests.pendingEvaluations.remove(id)
@@ -476,6 +565,22 @@ class WebViewJsExtensionHost(
         diagnostics.clearHostPromptDiagnostics()
     }
 
+    override fun snapshotExtensionStats(): Map<String, List<ExtensionApiStat>> =
+        webViews.keys.associateWith { statsCollector.stats(it) }.filterValues { it.isNotEmpty() }
+
+    override fun snapshotExtensionRecentCalls(): Map<String, List<ExtensionRecentCall>> =
+        webViews.keys.associateWith { statsCollector.recentCalls(it) }.filterValues { it.isNotEmpty() }
+
+    override fun snapshotExtensionErrors(): List<ExtensionErrorRecord> = diagnostics.snapshotExtensionErrors()
+
+    override fun declaredExtensionPermissions(): Map<String, Set<ExtensionPermission>> =
+        declaredPermissions.toMap()
+
+    override fun clearExtensionStats(extensionId: String?) {
+        statsCollector.clear(extensionId)
+        diagnostics.clearExtensionErrors(extensionId)
+    }
+
     private suspend fun publishLocalEvent(event: ExtensionEvent) {
         diagnostics.rememberHostEvent(event)
         mutableEvents.emit(event)
@@ -489,8 +594,24 @@ class WebViewJsExtensionHost(
     }
 
     override suspend fun executeStScript(script: String): SlashCommandResult {
-        val result = runCatching { slashCommandEngine.execute(script) }
-            .getOrElse { SlashCommandEngine.Result.error(it.message ?: "execution error") }
+        // The engine is a blocking interpreter (/delay sleeps up to 30s, loops run
+        // up to 1000 iterations). Callers arrive on Dispatchers.Main via
+        // viewModelScope — without this switch any /delay or heavy script freezes
+        // the UI thread outright (ANR after 5s of blocked input dispatch).
+        val result = withContext(Dispatchers.Default) {
+            // runInterruptible turns cancellation into a thread interrupt so a
+            // blocking /delay aborts with the cancelled generation instead of
+            // pinning the worker for its full 30s. The interrupt surfaces as
+            // CancellationException and must not be swallowed into an error
+            // result here.
+            try {
+                runInterruptible { slashCommandEngine.execute(script) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                SlashCommandEngine.Result.error(e.message ?: "execution error")
+            }
+        }
         return SlashCommandResult(
             handled = result.handled && !result.isError,
             output = result.output,
@@ -540,7 +661,7 @@ class WebViewJsExtensionHost(
         )
 
         val result = try {
-            withTimeoutOrNull(commandTimeoutMs) { deferred.await() }
+            withTimeoutOrNull(commandTimeoutMs) { awaitPending(deferred) }
         } finally {
             requests.pendingCommands.remove(requestId)
             requests.pendingCommandOwners.remove(requestId)
@@ -586,7 +707,7 @@ class WebViewJsExtensionHost(
             }
 
             val result = try {
-                withTimeoutOrNull(apiCallTimeoutMs) { deferred.await() }
+                withTimeoutOrNull(apiCallTimeoutMs) { awaitPending(deferred) }
             } finally {
                 requests.pendingVirtualApi.remove(requestId)
                 requests.pendingVirtualApiOwners.remove(requestId)
@@ -772,8 +893,11 @@ class WebViewJsExtensionHost(
                     headers = mapOf("X-Extension-Id" to extensionId, "X-Capability-Token" to token),
                 )
                 if (!checkApiPermissions(path, requestId)) return@launch
-                val response = runCatching {
-                    routeApiRequestForExtension(request)
+                // Handler-side timing for the async virtual API (the JS-side
+                // hop only measures the handoff, not the work).
+                val handlerStart = System.nanoTime()
+                val (response, failed) = runCatching {
+                    routeApiRequestForExtension(request) to false
                 }.getOrElse { error ->
                     VirtualApiResponse(
                         status = 500,
@@ -785,8 +909,14 @@ class WebViewJsExtensionHost(
                                 put("status", 500)
                             },
                         ),
-                    )
+                    ) to true
                 }
+                statsCollector.record(
+                    extensionId,
+                    "api ${method.uppercase()} ${path.substringBefore('?')}",
+                    (System.nanoTime() - handlerStart) / 1_000_000.0,
+                    failed,
+                )
                 deliverApiResponseToJs(requestId, response)
             }
         }
@@ -912,6 +1042,15 @@ class WebViewJsExtensionHost(
                         )
                     requests.pendingPermissionEvents[requestId] = event
                     mutableEvents.emit(event)
+                    scope.launch {
+                        delay(PERMISSION_REQUEST_TIMEOUT_MS)
+                        // The UI path (deliverPermissionResult) removes the event
+                        // entry first, so winning this atomic removal means the
+                        // dialog was never answered: deny and release the script.
+                        if (requests.pendingPermissionEvents.remove(requestId, event)) {
+                            deliverPermissionResult(requestId, granted = false)
+                        }
+                    }
                 }
             }
         }
@@ -933,7 +1072,17 @@ class WebViewJsExtensionHost(
                 requests.pendingLoadFailures.putIfAbsent(extensionId, detail)
                 requests.pendingLoads[extensionId]?.complete(Unit)
             }
-            reportExtensionLog(extensionId, "error", detail)
+            reportExtensionError(extensionId, detail)
+        }
+
+        /**
+         * Timing probe from the JS shim's tellevNative wrapper (all bridge
+         * methods except the skip-listed emit/log family). Pure telemetry —
+         * never affects the call it reports.
+         */
+        @JavascriptInterface
+        fun traceCall(name: String, millis: Double, failed: Boolean) {
+            statsCollector.record(extensionId, name, millis, failed)
         }
 
         // ── SillyTavern / 酒馆助手 shim bridge methods ──────────────────
@@ -1173,45 +1322,31 @@ class WebViewJsExtensionHost(
                 }.exceptionOrNull()
                 withContext(Dispatchers.Main) {
                     webViews[extensionId]?.evaluateJavascript(
-                        "window.__tellevWriteDone(" + JsonPrimitive(requestId) + "," +
-                            (failure?.message?.let { JsonPrimitive(it).toString() } ?: "null") + ")", null)
+                        "window.__tellevWriteDone(" + ExtensionScriptTemplate.jsExpression(JsonPrimitive(requestId).toString()) + "," +
+                            ExtensionScriptTemplate.jsExpression(
+                                failure?.message?.let { JsonPrimitive(it).toString() } ?: "null"
+                            ) + ")", null)
                 }
-            }
-        }
-
-        @JavascriptInterface
-        fun stSetChatMessage(index: String, field: String, value: String) {
-            if (!hasStorageBridgeAccess("stSetChatMessage")) return
-            val provider = _contextProvider
-            scope.launch {
-                requireCurrentRuntime()
-                val messageIndex = index.toIntOrNull()
-                if (messageIndex != null && provider?.setChatMessage(messageIndex, field, value) == true) {
-                    return@launch
-                }
-                val body = buildJsonObject {
-                    put("index", index)
-                    put("field", field)
-                    put("value", value)
-                }
-                apiRouter.route(
-                    VirtualApiRequest(
-                        method = "POST",
-                        path = "/api/chats/current/message-field",
-                        body = json.encodeToString(JsonObject.serializer(), body),
-                        headers = mapOf("X-Extension-Id" to extensionId, "X-Capability-Token" to token),
-                    ),
-                )
             }
         }
 
         @JavascriptInterface
         fun executeSlashCommands(requestId: String, scriptText: String) {
             scope.launch {
-                val engineResult = runCatching {
-                    slashCommandEngine.execute(scriptText)
-                }.getOrElse {
-                    SlashCommandEngine.Result.error(it.message ?: "execution error")
+                // Same discipline as executeStScript: the engine is a blocking
+                // interpreter, so keep it off other work and make cancellation
+                // interrupt it — plus a wall-clock cap so the JS-side promise
+                // backing this request always reaches a terminal state.
+                val engineResult = withContext(Dispatchers.Default) {
+                    try {
+                        withTimeoutOrNull(SLASH_SCRIPT_WALL_CLOCK_MS) {
+                            runInterruptible { slashCommandEngine.execute(scriptText) }
+                        } ?: SlashCommandEngine.Result.error("Slash script exceeded its wall-clock budget")
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        SlashCommandEngine.Result.error(e.message ?: "execution error")
+                    }
                 }
 
                 val result = if (engineResult.handled) {
@@ -1296,6 +1431,21 @@ class WebViewJsExtensionHost(
         }
     }
 
+    /**
+     * Structured script error for the debug panel: keeps the full stack (when
+     * the caller has one) alongside the event log. A multi-line [message]
+     * from the load guards is split — first line as the summary, rest as stack.
+     */
+    private fun reportExtensionError(extensionId: String, message: String, stack: String? = null) {
+        val (summary, frames) = if (stack == null && message.contains('\n')) {
+            message.trim().let { it.substringBefore('\n') to it.substringAfter('\n').trim().takeIf(String::isNotEmpty) }
+        } else {
+            message.trim() to stack?.takeIf(String::isNotBlank)
+        }
+        diagnostics.rememberExtensionError(extensionId, summary.ifBlank { "Unknown script error" }, frames)
+        reportExtensionLog(extensionId, "error", message)
+    }
+
     private data class RegisteredCommand(val extensionId: String, val command: SlashCommand)
     private data class RegisteredRoute(val extensionId: String, val route: VirtualApiRoute)
 
@@ -1312,6 +1462,21 @@ class WebViewJsExtensionHost(
             ExtensionScriptTemplate.EXTENSION_LOAD_GUARDS
 
         internal const val DEFAULT_SCRIPT_READY_TIMEOUT_MS: Long = 30_000L
+
+        /**
+         * Wall-clock bound for the JS-side slash-command promise. `/gen` is a
+         * stub, loop iterations are capped at 1000, and `/delay` tops out at
+         * 30s per call — five minutes is far beyond any honest script, so a
+         * promise still pending then means the engine is wedged and the
+         * awaiting module gets an error result instead of parking forever.
+         */
+        internal const val SLASH_SCRIPT_WALL_CLOCK_MS: Long = 300_000L
+
+        /**
+         * How long an unanswered permission dialog stays pending before the
+         * request is auto-denied and the awaiting script released.
+         */
+        internal const val PERMISSION_REQUEST_TIMEOUT_MS: Long = 60_000L
         internal const val CHARACTER_SCRIPT_READY_TIMEOUT_MS: Long = 90_000L
 
         internal val TAVERN_CONTEXT_TICK_CACHE_JS: String =

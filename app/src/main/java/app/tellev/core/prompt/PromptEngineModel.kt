@@ -12,6 +12,8 @@ import kotlinx.serialization.json.buildJsonObject
 
 internal const val DEFAULT_MAX_CONTEXT_TOKENS = 1_000_000
 internal const val DEFAULT_MAX_COMPLETION_TOKENS = 128 * 1_024
+/** Rough context cost of one image attachment (mainstream vision resolutions). */
+internal const val IMAGE_ATTACHMENT_TOKENS = 800
 
 /** [PromptMessage.channel] of the main/system prompt — anchor for BEFORE_PROMPT/IN_PROMPT injections. */
 internal const val CHANNEL_MAIN = "main"
@@ -45,6 +47,12 @@ data class PromptBuildRequest(
     val metadata: JsonObject = buildJsonObject { },
     /** Background instruction, separate from chat history and pending user input (ST quiet generation). */
     val quietPrompt: String? = null,
+    /** Live direct cast members; embedded snapshots remain a portable fallback. */
+    val supportingCharacters: List<CharacterCard> = emptyList(),
+    /** Saved chat floors visible to macros, including the current user floor in normal/swipe generation.
+     * [messages] remains the wire history without that floor, which is sent once via [userInput].
+     * Null keeps quiet/helper requests scoped to their supplied history rather than their instructions. */
+    val macroMessages: List<ChatMessage>? = null,
 )
 
 @Serializable
@@ -85,6 +93,39 @@ data class PromptDiagnostics(
     val activatedWorldEntryIds: List<String>,
     val estimatedTokenCount: Int? = null,
     val warnings: List<String> = emptyList(),
+    /** Per-entry activation detail for the context viewer; empty on legacy producers. */
+    val worldBookHits: List<WorldEntryHit> = emptyList(),
+    /** Entries considered but not injected, with the reason; empty on legacy producers. */
+    val rejectedWorldEntries: List<WorldEntryRejection> = emptyList(),
+)
+
+/** One activated world-book entry, with why it fired — for the context viewer. */
+@Serializable
+data class WorldEntryHit(
+    val entryId: String,
+    /** ST entry "comment" (the entry's title in the editor UI). */
+    val title: String? = null,
+    val bookName: String? = null,
+    val matchedKeys: List<String> = emptyList(),
+    val matchedSecondaryKeys: List<String> = emptyList(),
+    /** Fired unconditionally (constant entry or @@activate decorator). */
+    val unconditional: Boolean = false,
+    /** Activated by content of an earlier entry, not the chat text itself. */
+    val recursionLevel: Int = 0,
+    val tokens: Int? = null,
+)
+
+/** Why a considered world-book entry did not reach the prompt. */
+@Serializable
+data class WorldEntryRejection(
+    val entryId: String,
+    val title: String? = null,
+    val bookName: String? = null,
+    /**
+     * Stable reason token: `disabled` | `keyword_miss` | `probability` |
+     * `inclusion_group` | `budget` | `delayed_until_recursion`.
+     */
+    val reason: String,
 )
 
 internal data class ExtensionInjection(

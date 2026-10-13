@@ -330,11 +330,69 @@ class ExtensionsViewModel(
     }
 
     fun openDebug(extensionId: String) {
-        _uiState.update { it.copy(debugSheetTarget = extensionId, settingsSheetTarget = null) }
+        viewModelScope.launch {
+            val declared = extensionHost.declaredExtensionPermissions()
+            val granted = snapshotGrantedPermissions(declared.keys)
+            _uiState.update { state ->
+                state.copy(
+                    debugSheetTarget = extensionId,
+                    settingsSheetTarget = null,
+                    runtime = mergeHostDiagnostics(
+                        state.runtime,
+                        extensionHost.snapshotExtensionStats(),
+                        extensionHost.snapshotExtensionRecentCalls(),
+                        extensionHost.snapshotExtensionErrors(),
+                        declared,
+                        granted,
+                    ),
+                )
+            }
+        }
     }
 
     fun closeDebug() {
         _uiState.update { it.copy(debugSheetTarget = null) }
+    }
+
+    /** Debug-surface grant/revoke toggle; consent prompts remain the primary gate. */
+    fun toggleExtensionPermission(extensionId: String, permission: ExtensionPermission, granted: Boolean) {
+        viewModelScope.launch {
+            try {
+                if (granted) permissionManager.grantPermission(extensionId, permission)
+                else permissionManager.revokePermission(extensionId, permission)
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(error = UiStrings.get(S.extvm_permission_request_failed, e.message ?: e::class.simpleName))
+                }
+            }
+            _uiState.update { state ->
+                state.copy(
+                    runtime = state.runtime.copy(
+                        grantedPermissionsByExtensionId = state.runtime.grantedPermissionsByExtensionId +
+                            (extensionId to permissionManager.getGrantedPermissions(extensionId)),
+                    ),
+                )
+            }
+        }
+    }
+
+    private suspend fun snapshotGrantedPermissions(ids: Collection<String>): Map<String, Set<ExtensionPermission>> =
+        ids.associateWith { permissionManager.getGrantedPermissions(it) }
+
+    fun clearExtensionStats(extensionId: String?) {
+        extensionHost.clearExtensionStats(extensionId)
+        _uiState.update { state ->
+            state.copy(
+                runtime = state.runtime.copy(
+                    statsByExtensionId = if (extensionId == null) emptyMap()
+                    else state.runtime.statsByExtensionId - extensionId,
+                    recentCallsByExtensionId = if (extensionId == null) emptyMap()
+                    else state.runtime.recentCallsByExtensionId - extensionId,
+                    errors = if (extensionId == null) emptyList()
+                    else state.runtime.errors.filterNot { it.extensionId == extensionId },
+                ),
+            )
+        }
     }
 
     fun clearRuntimeLogs(extensionId: String?) {
@@ -486,7 +544,7 @@ class ExtensionsViewModel(
                         ?.let { dir.resolve(it) }
                         ?.takeIf { Files.isRegularFile(it) }
                         ?: manifest.metadata["main"]?.jsonPrimitive?.contentOrNull
-                            ?.let { dir.resolve(it) }
+                            ?.let { containedFile(dir, it) }
                             ?.takeIf { Files.isRegularFile(it) }
                         ?: dir.resolve("dist/index.js").takeIf { Files.isRegularFile(it) }
                         ?: dir.resolve("script.js").takeIf { Files.isRegularFile(it) }
@@ -602,6 +660,17 @@ class ExtensionsViewModel(
 
     private fun List<Int>.padToSize(size: Int, filler: Int): List<Int> =
         if (this.size >= size) this else this + List(size - this.size) { filler }
+
+    /**
+     * Resolves a manifest-declared file path against the extension directory,
+     * rejecting path traversal: `"../../anything"` or absolute paths would
+     * otherwise be read as extension JS and executed with the extension's
+     * declared permissions.
+     */
+    private fun containedFile(dir: Path, declared: String): Path? {
+        val resolved = dir.resolve(declared).normalize()
+        return resolved.takeIf { it.startsWith(dir.normalize()) }
+    }
 }
 
 class ExtensionsViewModelFactory(

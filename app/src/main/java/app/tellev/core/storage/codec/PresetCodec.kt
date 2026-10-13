@@ -29,6 +29,11 @@ internal object PresetCodec {
         val definitions = parsePresetPrompts(raw["prompts"])
         val (orderedPrompts, inferredUnused) = applyPromptOrder(definitions, raw["prompt_order"])
         val explicitUnused = parsePresetPrompts(raw["prompts_unused"] ?: raw["promptsUnused"])
+        // ST openai presets carry "reasoning_effort": auto/off/low/medium/high.
+        // "auto" maps to null (= our Auto passthrough); explicit levels persist.
+        val reasoningEffort = (raw["reasoning_effort"] as? JsonPrimitive)?.content?.trim()
+            ?.let(app.tellev.core.model.ReasoningEffort::fromStored)
+            ?.takeIf { it != app.tellev.core.model.ReasoningEffort.Auto }
         return GenerationPreset(
             id = path.nameWithoutExtension,
             name = path.nameWithoutExtension,
@@ -49,9 +54,10 @@ internal object PresetCodec {
                 ?: raw.intValue("max_context")
                 ?: raw.intValue("context_length"),
             maxCompletionTokens = completionTokens,
+            reasoningEffort = reasoningEffort,
             presencePenalty = raw.doubleValue("presence_penalty"),
             frequencyPenalty = raw.doubleValue("frequency_penalty"),
-            seed = raw["seed"]?.jsonPrimitive?.content?.toLongOrNull(),
+            seed = (raw["seed"] as? JsonPrimitive)?.content?.toLongOrNull(),
             stop = raw.stringList("stop"),
             prompts = orderedPrompts,
             promptsUnused = (inferredUnused + explicitUnused).distinctBy { it.identifier },
@@ -70,6 +76,11 @@ internal object PresetCodec {
         merged["relative"] = JsonPrimitive(prompt.relative)
         merged["depth"] = JsonPrimitive(prompt.depth)
         merged["order"] = JsonPrimitive(prompt.order)
+        // 注入序与禁用角色卡覆盖也是编辑器可改的类型化字段，必须显式写回，
+        // 否则保存后静默回滚（读取侧回落 100/false 与 ST 默认一致，旧预设
+        // 缺键仍按同一默认加载；落盘后写显式等值键，语义不变）。
+        merged["injection_order"] = JsonPrimitive(prompt.injectionOrder)
+        merged["forbid_overrides"] = JsonPrimitive(prompt.forbidOverrides)
         return JsonObject(merged)
     }
 
@@ -91,14 +102,17 @@ internal object PresetCodec {
         return JsonArray(groups)
     }
 
+    // `jsonPrimitive` throws on objects/arrays (a preset with
+    // "openai_max_tokens": {...} then took down the whole preset list);
+    // cast instead so unexpected shapes read as absent.
     private fun JsonObject.doubleValue(key: String): Double? =
-        this[key]?.jsonPrimitive?.content?.toDoubleOrNull()
+        (this[key] as? JsonPrimitive)?.content?.toDoubleOrNull()
 
     private fun JsonObject.intValue(key: String): Int? =
-        this[key]?.jsonPrimitive?.content?.toIntOrNull()
+        (this[key] as? JsonPrimitive)?.content?.toIntOrNull()
 
     private fun JsonObject.stringList(key: String): List<String> =
         (this[key] as? JsonArray)
-            ?.mapNotNull { it.jsonPrimitive.content.takeIf(String::isNotBlank) }
+            ?.mapNotNull { (it as? JsonPrimitive)?.content?.takeIf(String::isNotBlank) }
             ?: emptyList()
 }

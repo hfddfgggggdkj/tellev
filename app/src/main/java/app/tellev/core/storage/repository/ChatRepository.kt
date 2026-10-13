@@ -36,6 +36,7 @@ import java.util.UUID
 import kotlin.io.path.createDirectories
 import kotlin.io.path.exists
 import kotlin.io.path.listDirectoryEntries
+import kotlin.io.path.name
 import kotlin.io.path.nameWithoutExtension
 import kotlin.io.path.readText
 
@@ -57,8 +58,21 @@ internal class ChatRepository(
         }
         val reader = ChatSessionSummaryReader(json)
         roots.flatMap { root ->
+            // 会话归属=所在目录名（chats/<characterId>/）；群聊目录与 chats 根不视作角色卡。
+            val owner = if (root.parent == layout.chats) root.name else null
             if (!root.exists()) emptyList() else root.listDirectoryEntries("*.jsonl").mapNotNull { path ->
-                runCatching { reader.read(path) }.getOrElse { if (!path.exists()) null else throw it }
+                try {
+                    reader.read(path, owner)
+                } catch (error: Exception) {
+                    // 并发删除的会话直接跳过；损坏的会话隔离后跳过（M8），
+                    // 不再让单个坏文件拖垮整个列表。
+                    if (!path.exists()) null
+                    else if (error is java.io.IOException) throw error
+                    else {
+                        quarantineCorruptChat(path)
+                        null
+                    }
+                }
             }
         }.sortedByDescending { it.lastMessageAtMillis }
     }
@@ -74,11 +88,36 @@ internal class ChatRepository(
         }
         roots.flatMap { root ->
             if (!root.exists()) emptyList() else root.listDirectoryEntries("*.jsonl").mapNotNull { path ->
-                // 并发删除的会话直接跳过；仍然存在但损坏的会话照旧如实失败。
+                // 并发删除的会话直接跳过；损坏的会话隔离后跳过（M8），IOException 仍如实上抛。
                 if (!path.exists()) null
-                else runCatching { readJsonlChat(path) }.getOrElse { if (!path.exists()) null else throw it }
+                else try {
+                    readJsonlChat(path)
+                } catch (error: Exception) {
+                    if (error is java.io.IOException) throw error
+                    quarantineCorruptChat(path)
+                    null
+                }
             }
         }.sortedByDescending { session -> session.messages.lastOrNull()?.createdAtMillis ?: 0L }
+    }
+
+    /**
+     * M8: a corrupt JSONL used to fail the whole session list. Move it aside
+     * under chats/_corrupt — nothing deletes user data, the remaining sessions
+     * stay listable, and the timestamped name keeps it available for manual
+     * recovery. The top-level `*.jsonl` scans never descend into the directory.
+     */
+    private fun quarantineCorruptChat(path: Path) {
+        runCatching {
+            val corruptRoot = layout.chats.resolve("_corrupt")
+            corruptRoot.createDirectories()
+            val target = corruptRoot.resolve("${System.currentTimeMillis()}-${path.fileName}")
+            try {
+                Files.move(path, target, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
+            } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+                Files.move(path, target)
+            }
+        }
     }
 
     suspend fun readChatSession(id: String): ChatSession = withContext(Dispatchers.IO) {
@@ -87,8 +126,19 @@ internal class ChatRepository(
         readJsonlChat(path)
     }
 
-    suspend fun saveChatSession(session: ChatSession): Unit = withContext(Dispatchers.IO) {
-        chatWrites.withLock { writeChatSession(session); Unit }
+    suspend fun saveChatSession(session: ChatSession, expectedRevision: Long? = null): Unit = withContext(Dispatchers.IO) {
+        chatWrites.withLock {
+            try {
+                writeChatSession(session, expectedRevision)
+            } catch (error: IllegalStateException) {
+                // A half-committed journal record blocks new writes until recover()
+                // replays it — mirror commitChatMutation instead of surfacing it up.
+                if (error.message?.contains("Unrecovered write") != true) throw error
+                durableFiles.recover()
+                writeChatSession(session, expectedRevision)
+            }
+            Unit
+        }
     }
 
     suspend fun commitChatMutation(

@@ -10,20 +10,15 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -45,12 +40,11 @@ import app.tellev.core.model.Persona
 import app.tellev.core.model.PresetCategory
 import app.tellev.feature.update.UpdateViewModel
 import app.tellev.util.UriUtils
-import app.tellev.ui.AtmosphereIntro
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.Row
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.FilterChip
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.rememberCoroutineScope
@@ -62,13 +56,15 @@ import kotlinx.coroutines.launch
 internal fun SettingsScreen(
     viewModel: SettingsViewModel,
     updateViewModel: UpdateViewModel,
-    onOpenProviderSettings: () -> Unit,
-    providerDetailsOnly: Boolean = false,
-    onOpenImageGenSettings: () -> Unit = {},
-    imageGenDetailsOnly: Boolean = false,
+    onOpenModelServices: () -> Unit,
+    onOpenUsageStats: () -> Unit = {},
+    onOpenExtensions: () -> Unit = {},
+    onOpenPromptOptimizer: () -> Unit = {},
     presetFocusRequest: Int = 0,
     onOpenGuide: (GuideKind) -> Unit = {},
-    onBack: () -> Unit = {},
+    // 模型服务弹层打开时 settingsState.info/error 由弹层内联反馈消费（弹层没有
+    // snackbar），本页跳过消费，避免把弹层要展示的反馈先吞掉。
+    suppressFeedbackSnackbar: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -91,15 +87,8 @@ internal fun SettingsScreen(
     var editingPersona by remember { mutableStateOf<Persona?>(null) }
     var showExportDialog by remember { mutableStateOf(false) }
     var showImportDialog by remember { mutableStateOf(false) }
-    var apiKeyVisible by remember { mutableStateOf(false) }
     var pendingPresetImportUri by remember { mutableStateOf<Uri?>(null) }
     var pendingPresetExport by remember { mutableStateOf<GenerationPreset?>(null) }
-    var showAdvancedDialog by remember { mutableStateOf(false) }
-    var showComfyWorkflowDialog by remember { mutableStateOf(false) }
-    var showComfyParamsDialog by remember { mutableStateOf(false) }
-    var showNovelAiParamsDialog by remember { mutableStateOf(false) }
-    var novelAiTokenVisible by remember { mutableStateOf(false) }
-    var pendingDeleteConfigId by remember { mutableStateOf<String?>(null) }
 
     val importLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent(),
@@ -140,25 +129,32 @@ internal fun SettingsScreen(
         }
     }
 
-    LaunchedEffect(state.error) {
-        state.error?.let {
-            snackbarHostState.showSnackbar(it)
-            viewModel.clearError()
+    // 模型服务弹层打开期间反馈归弹层（内联展示），这里跳过消费；弹层关闭后
+    // 若仍有残留，key 变化会重启本 effect 再走一遍消费。
+    LaunchedEffect(state.error, suppressFeedbackSnackbar) {
+        if (!suppressFeedbackSnackbar) {
+            state.error?.let {
+                snackbarHostState.showSnackbar(it)
+                viewModel.clearError()
+            }
         }
     }
 
-    LaunchedEffect(state.info) {
-        state.info?.let {
-            snackbarHostState.showSnackbar(it)
-            viewModel.clearInfo()
+    LaunchedEffect(state.info, suppressFeedbackSnackbar) {
+        if (!suppressFeedbackSnackbar) {
+            state.info?.let {
+                snackbarHostState.showSnackbar(it)
+                viewModel.clearInfo()
+            }
         }
     }
 
-    LaunchedEffect(presetFocusRequest, state.isLoading, providerDetailsOnly) {
-        if (presetFocusRequest > 0 && !state.isLoading && !providerDetailsOnly && !imageGenDetailsOnly) {
+    LaunchedEffect(presetFocusRequest, state.isLoading) {
+        if (presetFocusRequest > 0 && !state.isLoading) {
             settingsSection = 0
-            // Intro, provider card/divider, image card/divider, preset divider.
-            listState.animateScrollToItem(6)
+            // 目标 index 5 = 预设分组头；其上依次：使用统计卡、优化提示词卡、
+            // 模型服务卡与分隔线、预设分隔线。
+            listState.animateScrollToItem(5)
         }
     }
 
@@ -166,25 +162,7 @@ internal fun SettingsScreen(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
-                title = {
-                    Text(
-                        when {
-                            providerDetailsOnly -> stringResource(R.string.setscreen_title_provider)
-                            imageGenDetailsOnly -> stringResource(R.string.setscreen_title_imagegen)
-                            else -> stringResource(R.string.setscreen_title_settings)
-                        },
-                    )
-                },
-                navigationIcon = {
-                    if (providerDetailsOnly || imageGenDetailsOnly) {
-                        IconButton(onClick = onBack) {
-                            Icon(
-                                Icons.AutoMirrored.Filled.ArrowBack,
-                                contentDescription = stringResource(R.string.setscreen_back_cd),
-                            )
-                        }
-                    }
-                },
+                title = { Text(stringResource(R.string.setscreen_title_settings)) },
                 colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.background,
                 ),
@@ -203,7 +181,6 @@ internal fun SettingsScreen(
             }
         } else {
             Column(Modifier.fillMaxSize().padding(padding)) {
-            if (!providerDetailsOnly && !imageGenDetailsOnly) {
                 val categories = listOf(R.string.ui_settings_models, R.string.ui_settings_identity,
                     R.string.ui_settings_appearance, R.string.ui_settings_data)
                 Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 18.dp),
@@ -216,7 +193,6 @@ internal fun SettingsScreen(
                         )
                     }
                 }
-            }
             LazyColumn(
                 state = listState,
                 modifier = Modifier
@@ -224,54 +200,25 @@ internal fun SettingsScreen(
                 verticalArrangement = Arrangement.spacedBy(16.dp),
                 contentPadding = PaddingValues(16.dp),
             ) {
-                if (imageGenDetailsOnly) {
-                    imageGenDetailsItems(
-                        state = state,
-                        viewModel = viewModel,
-                        onOpenComfyWorkflowDialog = { showComfyWorkflowDialog = true },
-                        onOpenComfyParamsDialog = { showComfyParamsDialog = true },
-                        onOpenNovelAiParamsDialog = { showNovelAiParamsDialog = true },
-                        novelAiTokenVisible = novelAiTokenVisible,
-                        onToggleNovelAiTokenVisible = { novelAiTokenVisible = !novelAiTokenVisible },
-                    )
-                } else if (providerDetailsOnly) {
-                    providerDetailsItems(
-                        state = state,
-                        viewModel = viewModel,
-                        apiKeyVisible = apiKeyVisible,
-                        onToggleApiKeyVisible = { apiKeyVisible = !apiKeyVisible },
-                        onOpenAdvancedDialog = { showAdvancedDialog = true },
-                        onDeleteCustomConfigClick = { pendingDeleteConfigId = it },
-                    )
-                } else {
-                    item(key = "settings_intro") {
-                        AtmosphereIntro(
-                            title = stringResource(R.string.ui_settings_intro),
-                            subtitle = stringResource(R.string.ui_settings_intro_hint),
-                            icon = Icons.Default.Settings,
-                        )
-                    }
                     if (settingsSection == 0) {
+                    item(key = "usage_stats_entry") {
+                        UsageStatsEntryCard(onClick = onOpenUsageStats)
+                    }
+
+                    item(key = "dsh_prompt_optimizer_entry") {
+                        // 优化提示词（写作助手）设置入口。
+                        PromptOptimizerEntryCard(onClick = onOpenPromptOptimizer)
+                    }
+
                     item(key = "provider_quick_switch") {
                         ProviderQuickSwitchCard(
                             state = state,
                             onSelect = viewModel::activateProvider,
-                            onManage = onOpenProviderSettings,
+                            onManage = onOpenModelServices,
                         )
                     }
 
                     item(key = "provider_quick_divider") {
-                        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-                    }
-
-                    item(key = "imagegen_entry") {
-                        ImageGenEntryCard(
-                            state = state,
-                            onClick = onOpenImageGenSettings,
-                        )
-                    }
-
-                    item(key = "imagegen_entry_divider") {
                         HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
                     }
 
@@ -294,6 +241,30 @@ internal fun SettingsScreen(
                         onAddSecret = { showAddSecretDialog = true },
                         onDeleteSecret = { viewModel.deleteSecret(it) },
                     )
+
+                    item(key = "cleartext_setting") {
+                        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = stringResource(R.string.setnet_cleartext),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                )
+                                Text(
+                                    text = stringResource(R.string.setnet_cleartext_desc),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Switch(
+                                checked = state.allowRemoteCleartext,
+                                onCheckedChange = viewModel::setAllowRemoteCleartext,
+                            )
+                        }
+                    }
                     }
 
                     if (settingsSection == 1) {
@@ -315,9 +286,10 @@ internal fun SettingsScreen(
                     appearanceSectionItems(
                         state = state,
                         onSetThemeMode = viewModel::setThemeMode,
-                        onSetThemeAccent = viewModel::setThemeAccent,
-                        onSetChatBubbleAlpha = viewModel::setChatBubbleAlpha,
-                        onSetChatFontSizeSp = viewModel::setChatFontSizeSp,
+                        onPreviewChatBubbleAlpha = viewModel::previewChatBubbleAlpha,
+                        onPersistChatBubbleAlpha = { viewModel.setChatBubbleAlpha(state.chatBubbleAlpha) },
+                        onPreviewChatFontSizeSp = viewModel::previewChatFontSizeSp,
+                        onPersistChatFontSizeSp = { viewModel.setChatFontSizeSp(state.chatFontSizeSp) },
                     )
 
                     languageSectionItems(
@@ -330,6 +302,11 @@ internal fun SettingsScreen(
                     }
 
                     if (settingsSection == 3) {
+                    // 拓展并入设置：脚本、正则、记忆等扩展能力统一从这里进。
+                    item(key = "extensions_entry") {
+                        ExtensionsEntryCard(onClick = onOpenExtensions)
+                    }
+
                     backupSectionItems(
                         onExportClick = { showExportDialog = true },
                         onImportClick = { showImportDialog = true },
@@ -342,14 +319,13 @@ internal fun SettingsScreen(
                         onOpenGuide = onOpenGuide,
                     )
                     }
-                }
             }
             }
         }
     }
 
     // Preset creation dialog
-    if (!providerDetailsOnly && showPresetDialog) {
+    if (showPresetDialog) {
         PresetCreationDialog(
             providers = state.providers.map { it.id to it.displayName },
             onDismiss = { showPresetDialog = false },
@@ -360,7 +336,7 @@ internal fun SettingsScreen(
         )
     }
 
-    if (!providerDetailsOnly) editingPreset?.let { preset ->
+    editingPreset?.let { preset ->
         PresetEditDialog(
             preset = preset,
             onDismiss = { editingPreset = null },
@@ -379,7 +355,7 @@ internal fun SettingsScreen(
         )
     }
 
-    if (!providerDetailsOnly) pendingPresetImportUri?.let { uri ->
+    pendingPresetImportUri?.let { uri ->
         val fileName = remember(uri) { UriUtils.resolveDisplayName(context, uri) }
             ?: uri.lastPathSegment
             ?: "preset.json"
@@ -399,7 +375,7 @@ internal fun SettingsScreen(
         )
     }
 
-    if (!providerDetailsOnly && showAddSecretDialog) {
+    if (showAddSecretDialog) {
         AddSecretDialog(
             onDismiss = { showAddSecretDialog = false },
             onSave = { key, value ->
@@ -409,7 +385,7 @@ internal fun SettingsScreen(
         )
     }
 
-    if (!providerDetailsOnly && showPersonaDialog) {
+    if (showPersonaDialog) {
         PersonaEditDialog(
             existing = editingPersona,
             onDismiss = {
@@ -429,7 +405,7 @@ internal fun SettingsScreen(
         )
     }
 
-    if (!providerDetailsOnly && showExportDialog) {
+    if (showExportDialog) {
         BackupExportDialog(
             onDismiss = { showExportDialog = false },
             onConfirm = {
@@ -439,7 +415,7 @@ internal fun SettingsScreen(
         )
     }
 
-    if (!providerDetailsOnly && showImportDialog) {
+    if (showImportDialog) {
         BackupImportDialog(
             onDismiss = { showImportDialog = false },
             onConfirm = {
@@ -448,61 +424,29 @@ internal fun SettingsScreen(
             },
         )
     }
+}
 
-    if (showAdvancedDialog) {
-        CompatibilityAdvancedDialog(
-            state = state,
-            viewModel = viewModel,
-            onDismiss = { showAdvancedDialog = false },
-        )
-    }
 
-    if (showComfyWorkflowDialog) {
-        ComfyWorkflowDialog(
-            state = state,
-            viewModel = viewModel,
-            onDismiss = { showComfyWorkflowDialog = false },
-        )
-    }
-
-    if (showComfyParamsDialog) {
-        ComfyParamsDialog(
-            state = state,
-            viewModel = viewModel,
-            onDismiss = { showComfyParamsDialog = false },
-        )
-    }
-
-    if (showNovelAiParamsDialog) {
-        NovelAiImageParamsDialog(
-            state = state,
-            viewModel = viewModel,
-            onDismiss = { showNovelAiParamsDialog = false },
-        )
-    }
-
-    pendingDeleteConfigId?.let { configId ->
-        val configName = state.customConfigs.firstOrNull { it.id == configId }?.name
-            ?: stringResource(R.string.setscreen_this_config)
-        AlertDialog(
-            onDismissRequest = { pendingDeleteConfigId = null },
-            title = { Text(stringResource(R.string.setscreen_delete_config_title)) },
-            text = { Text(stringResource(R.string.setscreen_delete_config_message, configName)) },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        viewModel.deleteCustomConfig(configId)
-                        pendingDeleteConfigId = null
-                    },
-                ) {
-                    Text(stringResource(R.string.setscreen_delete), color = MaterialTheme.colorScheme.error)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { pendingDeleteConfigId = null }) {
-                    Text(stringResource(R.string.setscreen_cancel))
-                }
-            },
-        )
+/** 优化提示词设置入口卡。 */
+@Composable
+private fun PromptOptimizerEntryCard(onClick: () -> Unit) {
+    androidx.compose.material3.Surface(
+        onClick = onClick,
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    stringResource(R.string.dsh_optimize_prompt),
+                    style = MaterialTheme.typography.bodyLarge,
+                )
+            }
+            Text("›", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
     }
 }

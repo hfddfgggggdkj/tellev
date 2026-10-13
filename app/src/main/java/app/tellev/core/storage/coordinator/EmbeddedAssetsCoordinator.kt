@@ -7,6 +7,7 @@ import app.tellev.core.storage.JournaledFileWriter
 import app.tellev.core.storage.StDataStore
 import app.tellev.core.storage.StDirectoryLayout
 import app.tellev.core.storage.codec.CharacterCodec
+import app.tellev.core.storage.safeStorageChild
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -30,6 +31,8 @@ internal class EmbeddedAssetsCoordinator(
     private val durableFiles: JournaledFileWriter,
     private val characterImporter: CharacterImporter,
     private val saveWorldBook: suspend (WorldBook) -> Unit,
+    private val readDisabledWorldIds: suspend () -> Set<String> = { emptySet() },
+    private val saveDisabledWorldIds: suspend (Set<String>) -> Unit = {},
 ) {
     private val supportedCharacterExtensions = setOf("png", "webp", "json")
 
@@ -65,12 +68,22 @@ internal class EmbeddedAssetsCoordinator(
         card.characterBook
             ?.takeIf { it.entries.isNotEmpty() }
             ?.let { embeddedBook ->
-                saveWorldBook(
-                    embeddedBook.copy(
-                        id = StDataStore.embeddedCharacterBookId(card.id),
-                        name = embeddedBook.name.ifBlank { "${card.name} 角色书" },
-                    ),
-                )
+                val bookId = StDataStore.embeddedCharacterBookId(card.id)
+                // worlds/<id>_character_book.json is the LIVE copy after first
+                // materialization: the world editor writes there and never syncs
+                // back into the card, so re-saving the card (description tweak,
+                // avatar swap) used to clobber user edits with the stale in-card
+                // snapshot. Once materialized, the disk copy wins; the card still
+                // carries its own embedded original for re-export.
+                val materialized = safeStorageChild(layout.worlds, bookId, ".json")
+                if (!materialized.exists()) {
+                    saveWorldBook(
+                        embeddedBook.copy(
+                            id = bookId,
+                            name = embeddedBook.name.ifBlank { "${card.name} 角色书" },
+                        ),
+                    )
+                }
             }
 
         // Cards without an extensions object still get a manifest (with the fingerprint):
@@ -98,6 +111,27 @@ internal class EmbeddedAssetsCoordinator(
             cardFingerprint?.let { put("tellev_card_fingerprint", JsonPrimitive(it)) }
         }
         writeCharacterAsset(assetDir, "manifest.json", manifest)
+    }
+
+    /**
+     * Import path for a card's embedded assets.
+     *
+     * The card's `character_book` is still materialized so it shows up in the
+     * world-book list and can be edited, but it is recorded in the disabled set
+     * so an import does not bind it to the character. SillyTavern activates
+     * embedded lorebooks the moment a card is imported; that surprised users who
+     * only wanted the card itself. The book stays one tap away in the world
+     * screen via `toggleWorldActivation`, and the disabled entry is durable, so
+     * the boot-time rebuild and `selectCharacter` both leave it alone.
+     *
+     * Re-importing a card resets that choice: the book goes back to disabled.
+     */
+    suspend fun importEmbeddedCharacterAssets(card: CharacterCard, cardFingerprint: String? = null) {
+        saveEmbeddedCharacterAssets(card, cardFingerprint)
+        if (card.characterBook?.entries?.isNotEmpty() != true) return
+        val bookId = StDataStore.embeddedCharacterBookId(card.id)
+        val disabled = readDisabledWorldIds()
+        if (bookId !in disabled) saveDisabledWorldIds(disabled + bookId)
     }
 
     /** Cheap stat fingerprint (size + mtime): no card bytes are read. */

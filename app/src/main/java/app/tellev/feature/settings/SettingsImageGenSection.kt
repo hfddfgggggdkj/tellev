@@ -2,8 +2,6 @@ package app.tellev.feature.settings
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -11,16 +9,10 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
-import androidx.compose.material.icons.filled.Cloud
-import androidx.compose.material.icons.filled.Palette
-import androidx.compose.material.icons.filled.Save
-import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
@@ -31,14 +23,10 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
-import androidx.compose.material3.FilledTonalButton
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuAnchorType
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -57,405 +45,10 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import app.tellev.R
-import app.tellev.core.i18n.S
-import app.tellev.core.i18n.UiStrings
 import app.tellev.core.provider.ComfyWorkflowTemplate
+import app.tellev.core.provider.ImageProviderProfile
 import app.tellev.core.provider.NovelAiImageSettings
-import app.tellev.core.provider.ProviderCatalog
-
-/** 主设置页生图入口卡片的摘要行：当前引擎与各引擎配置状态。 */
-internal fun imageGenSummary(state: SettingsUiState): String {
-    val engineName = when (state.imageEngine) {
-        ProviderCatalog.NOVELAI_IMAGE -> "NovelAI"
-        else -> "ComfyUI"
-    }
-    val configured = UiStrings.get(S.setimg_state_configured)
-    val unconfigured = UiStrings.get(S.setimg_state_unconfigured)
-    val parts = listOf(
-        "ComfyUI " + if (state.comfySettings.workflowJson.isNotBlank()) configured else unconfigured,
-        "NovelAI " + if (state.novelAiToken.isNotBlank()) configured else unconfigured,
-    )
-    return UiStrings.get(S.setimg_entry_summary, engineName, parts.joinToString(" · "))
-}
-
-@Composable
-internal fun ImageGenEntryCard(
-    state: SettingsUiState,
-    onClick: () -> Unit,
-) {
-    Card(
-        onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(
-                Icons.Default.Tune,
-                contentDescription = null,
-                modifier = Modifier.size(24.dp),
-                tint = MaterialTheme.colorScheme.primary,
-            )
-            Spacer(modifier = Modifier.width(12.dp))
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(2.dp),
-            ) {
-                Text(stringResource(R.string.setimg_entry_title), style = MaterialTheme.typography.titleMedium)
-                Text(
-                    imageGenSummary(state),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            Icon(
-                Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
-internal fun LazyListScope.imageGenDetailsItems(
-    state: SettingsUiState,
-    viewModel: SettingsViewModel,
-    onOpenComfyWorkflowDialog: () -> Unit,
-    onOpenComfyParamsDialog: () -> Unit,
-    onOpenNovelAiParamsDialog: () -> Unit,
-    novelAiTokenVisible: Boolean,
-    onToggleNovelAiTokenVisible: () -> Unit,
-) {
-    // ── 生图引擎：聊天「生成图片」按钮走哪个引擎，各引擎配置见下方对应区块 ──
-    item(key = "image_engine_header") {
-        SectionHeader(
-            icon = Icons.Default.Tune,
-            title = stringResource(R.string.setimg_engine_header),
-        )
-    }
-    item(key = "image_engine") {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(
-                stringResource(R.string.setimg_engine_desc),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(
-                    selected = state.imageEngine == ProviderCatalog.COMFYUI,
-                    onClick = { viewModel.selectImageEngine(ProviderCatalog.COMFYUI) },
-                    label = { Text(stringResource(R.string.setimg_engine_comfy)) },
-                )
-                FilterChip(
-                    selected = state.imageEngine == ProviderCatalog.NOVELAI_IMAGE,
-                    onClick = { viewModel.selectImageEngine(ProviderCatalog.NOVELAI_IMAGE) },
-                    label = { Text(stringResource(R.string.setimg_engine_novelai)) },
-                )
-            }
-        }
-    }
-    item(key = "image_engine_divider") {
-        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-    }
-
-    // ── 生图模型（ComfyUI）；未配置时聊天界面不出现生图入口 ──
-    item(key = "comfy_header") {
-        SectionHeader(
-            icon = Icons.Default.Palette,
-            title = stringResource(R.string.setimg_comfy_header),
-        )
-    }
-    item(key = "comfy_url") {
-        OutlinedTextField(
-            value = state.comfyBaseUrl,
-            onValueChange = viewModel::updateComfyBaseUrl,
-            label = { Text(stringResource(R.string.setimg_comfy_url_label)) },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-            placeholder = { Text("http://192.168.1.100:8188") },
-            supportingText = {
-                Text(stringResource(R.string.setimg_comfy_url_help))
-            },
-        )
-    }
-    item(key = "comfy_model") {
-        var comfyModelMenu by remember { mutableStateOf(false) }
-        ExposedDropdownMenuBox(
-            expanded = comfyModelMenu && state.comfyModels.isNotEmpty(),
-            onExpandedChange = {
-                comfyModelMenu = it && state.comfyModels.isNotEmpty()
-            },
-        ) {
-            OutlinedTextField(
-                value = state.comfyModel,
-                onValueChange = {
-                    viewModel.updateComfyModel(it)
-                    comfyModelMenu = state.comfyModels.isNotEmpty()
-                },
-                label = { Text(stringResource(R.string.setimg_comfy_model_label)) },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .menuAnchor(MenuAnchorType.PrimaryEditable),
-                singleLine = true,
-                placeholder = { Text(stringResource(R.string.setimg_comfy_model_placeholder)) },
-                trailingIcon = {
-                    if (state.comfyModels.isNotEmpty()) {
-                        ExposedDropdownMenuDefaults.TrailingIcon(expanded = comfyModelMenu)
-                    }
-                },
-                supportingText = {
-                    Text(
-                        if (state.comfyModels.isEmpty()) {
-                            stringResource(R.string.setimg_comfy_model_help_empty)
-                        } else {
-                            stringResource(R.string.setimg_comfy_model_help_count, state.comfyModels.size)
-                        },
-                    )
-                },
-            )
-            ExposedDropdownMenu(
-                expanded = comfyModelMenu && state.comfyModels.isNotEmpty(),
-                onDismissRequest = { comfyModelMenu = false },
-            ) {
-                val filter = state.comfyModel
-                state.comfyModels
-                    .filter { it.contains(filter, ignoreCase = true) || it == state.comfyModel }
-                    .take(100)
-                    .forEach { model ->
-                        DropdownMenuItem(
-                            text = { Text(model) },
-                            onClick = {
-                                viewModel.updateComfyModel(model)
-                                comfyModelMenu = false
-                            },
-                        )
-                    }
-            }
-        }
-    }
-    item(key = "comfy_workflow") {
-        OutlinedButton(
-            onClick = onOpenComfyWorkflowDialog,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text(
-                if (state.comfySettings.workflowJson.isBlank()) {
-                    stringResource(R.string.setimg_workflow_unconfigured)
-                } else {
-                    stringResource(R.string.setimg_workflow_configured)
-                },
-            )
-        }
-    }
-    item(key = "comfy_params") {
-        OutlinedButton(
-            onClick = onOpenComfyParamsDialog,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text(stringResource(R.string.setimg_comfy_params_button))
-        }
-    }
-    item(key = "comfy_actions") {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            OutlinedButton(
-                onClick = viewModel::testComfyConnection,
-                modifier = Modifier.weight(1f),
-                enabled = !state.isTestingComfy,
-            ) {
-                if (state.isTestingComfy) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(16.dp),
-                        strokeWidth = 2.dp,
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                }
-                Text(if (state.isTestingComfy) stringResource(R.string.setimg_testing) else stringResource(R.string.setimg_test_connection))
-            }
-            FilledTonalButton(
-                onClick = viewModel::saveComfyConfig,
-                modifier = Modifier.weight(1f),
-            ) {
-                Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(stringResource(R.string.setimg_save))
-            }
-        }
-    }
-    if (state.comfyStatus != null) {
-        item(key = "comfy_status") {
-            val status = state.comfyStatus!!
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = if (status.available) MaterialTheme.colorScheme.primaryContainer
-                    else MaterialTheme.colorScheme.errorContainer,
-                ),
-            ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Text(
-                        text = if (status.available) stringResource(R.string.setimg_status_connected) else stringResource(R.string.setimg_status_failed),
-                        style = MaterialTheme.typography.titleSmall,
-                        color = if (status.available) MaterialTheme.colorScheme.onPrimaryContainer
-                        else MaterialTheme.colorScheme.onErrorContainer,
-                    )
-                    Text(
-                        text = status.message,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (status.available) MaterialTheme.colorScheme.onPrimaryContainer
-                        else MaterialTheme.colorScheme.onErrorContainer,
-                    )
-                }
-            }
-        }
-    }
-
-    item(key = "comfy_divider") {
-        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-    }
-
-    // ── NovelAI 生图（远程）：行为对齐酒馆 novel 源 ──
-    item(key = "novelai_header") {
-        SectionHeader(
-            icon = Icons.Default.Cloud,
-            title = stringResource(R.string.setimg_novelai_header),
-        )
-    }
-    item(key = "novelai_token") {
-        OutlinedTextField(
-            value = state.novelAiToken,
-            onValueChange = viewModel::updateNovelAiToken,
-            label = { Text(stringResource(R.string.setimg_novelai_token_label)) },
-            modifier = Modifier.fillMaxWidth(),
-            singleLine = true,
-            visualTransformation = if (novelAiTokenVisible) VisualTransformation.None
-            else PasswordVisualTransformation(),
-            trailingIcon = {
-                IconButton(onClick = onToggleNovelAiTokenVisible) {
-                    Icon(
-                        if (novelAiTokenVisible) Icons.Default.VisibilityOff
-                        else Icons.Default.Visibility,
-                        contentDescription = null,
-                    )
-                }
-            },
-            supportingText = {
-                Text(stringResource(R.string.setimg_novelai_token_help))
-            },
-        )
-    }
-    item(key = "novelai_model") {
-        var novelModelMenu by remember { mutableStateOf(false) }
-        val modelDisplay = NovelAiImageSettings.MODELS
-            .firstOrNull { it.first == state.novelAiSettings.model }
-            ?.second ?: state.novelAiSettings.model
-        ExposedDropdownMenuBox(
-            expanded = novelModelMenu,
-            onExpandedChange = { novelModelMenu = it },
-        ) {
-            OutlinedTextField(
-                value = modelDisplay,
-                onValueChange = {},
-                readOnly = true,
-                label = { Text(stringResource(R.string.setimg_model_label)) },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .menuAnchor(MenuAnchorType.PrimaryNotEditable),
-                trailingIcon = {
-                    ExposedDropdownMenuDefaults.TrailingIcon(expanded = novelModelMenu)
-                },
-            )
-            ExposedDropdownMenu(
-                expanded = novelModelMenu,
-                onDismissRequest = { novelModelMenu = false },
-            ) {
-                NovelAiImageSettings.MODELS.forEach { (id, name) ->
-                    DropdownMenuItem(
-                        text = { Text(name) },
-                        onClick = {
-                            viewModel.updateNovelAiSettings { it.copy(model = id) }
-                            novelModelMenu = false
-                        },
-                    )
-                }
-            }
-        }
-    }
-    item(key = "novelai_params") {
-        OutlinedButton(
-            onClick = onOpenNovelAiParamsDialog,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text(stringResource(R.string.setimg_novelai_params_button))
-        }
-    }
-    item(key = "novelai_actions") {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            OutlinedButton(
-                onClick = viewModel::testNovelAiImage,
-                modifier = Modifier.weight(1f),
-                enabled = !state.isTestingNovelAi,
-            ) {
-                if (state.isTestingNovelAi) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(16.dp),
-                        strokeWidth = 2.dp,
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                }
-                Text(if (state.isTestingNovelAi) stringResource(R.string.setimg_testing) else stringResource(R.string.setimg_test_token))
-            }
-            FilledTonalButton(
-                onClick = viewModel::saveNovelAiImageConfig,
-                modifier = Modifier.weight(1f),
-            ) {
-                Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(stringResource(R.string.setimg_save))
-            }
-        }
-    }
-    if (state.novelAiStatus != null) {
-        item(key = "novelai_status") {
-            val status = state.novelAiStatus!!
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(
-                    containerColor = if (status.available) MaterialTheme.colorScheme.primaryContainer
-                    else MaterialTheme.colorScheme.errorContainer,
-                ),
-            ) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Text(
-                        text = if (status.available) stringResource(R.string.setimg_token_ok) else stringResource(R.string.setimg_token_unavailable),
-                        style = MaterialTheme.typography.titleSmall,
-                        color = if (status.available) MaterialTheme.colorScheme.onPrimaryContainer
-                        else MaterialTheme.colorScheme.onErrorContainer,
-                    )
-                    Text(
-                        text = status.message,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (status.available) MaterialTheme.colorScheme.onPrimaryContainer
-                        else MaterialTheme.colorScheme.onErrorContainer,
-                    )
-                }
-            }
-        }
-    }
-    item(key = "novelai_divider") {
-        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-    }
-}
-
+import app.tellev.core.provider.ProviderConfigPersistence
 
 @Composable
 internal fun ComfyWorkflowDialog(
@@ -891,6 +484,259 @@ internal fun NovelAiImageParamsDialog(
                 },
             ) {
                 Text(stringResource(R.string.setimg_ok))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.setimg_cancel))
+            }
+        },
+    )
+}
+
+/**
+ * Edit dialog for one custom image endpoint profile. [initial] null creates a
+ * new profile; all request fields are free-form so non-OpenAI relays stay
+ * reachable, and blank optional fields are omitted from request bodies.
+ */
+@Composable
+internal fun ImageProfileEditDialog(
+    initial: ImageProviderProfile?,
+    isTesting: Boolean,
+    testStatus: app.tellev.core.provider.ProviderStatus?,
+    onTest: (ImageProviderProfile) -> Unit,
+    onSave: (ImageProviderProfile) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var name by remember { mutableStateOf(initial?.name ?: "") }
+    var baseUrl by remember { mutableStateOf(initial?.baseUrl ?: "") }
+    var apiKey by remember { mutableStateOf(initial?.apiKey ?: "") }
+    var apiKeyVisible by remember { mutableStateOf(false) }
+    var model by remember { mutableStateOf(initial?.model ?: "") }
+    var path by remember { mutableStateOf(initial?.path ?: ImageProviderProfile.DEFAULT_PATH) }
+    var modelsPath by remember { mutableStateOf(initial?.modelsPath ?: ImageProviderProfile.DEFAULT_MODELS_PATH) }
+    var size by remember { mutableStateOf(initial?.size ?: "1024x1024") }
+    var quality by remember { mutableStateOf(initial?.quality ?: "") }
+    var style by remember { mutableStateOf(initial?.style ?: "") }
+    var responseFormat by remember { mutableStateOf(initial?.responseFormat ?: "") }
+    var sendNegativePrompt by remember { mutableStateOf(initial?.sendNegativePrompt ?: false) }
+    var extraBody by remember { mutableStateOf(initial?.extraBody?.toString() ?: "") }
+    var extraBodyError by remember { mutableStateOf(false) }
+    var showValidation by remember { mutableStateOf(false) }
+
+    val nameError = showValidation && name.isBlank()
+    val baseUrlError = showValidation && baseUrl.isBlank()
+
+    fun buildProfile(): ImageProviderProfile? {
+        val extra = if (extraBody.isBlank()) {
+            kotlinx.serialization.json.JsonObject(emptyMap())
+        } else {
+            ImageProviderProfile.parseExtraBody(extraBody) ?: return null
+        }
+        return ImageProviderProfile(
+            id = initial?.id ?: ProviderConfigPersistence.newImageProviderProfileId(),
+            name = name.trim(),
+            baseUrl = baseUrl.trim(),
+            apiKey = apiKey.trim(),
+            model = model.trim(),
+            path = path.trim().ifBlank { ImageProviderProfile.DEFAULT_PATH },
+            modelsPath = modelsPath.trim().ifBlank { ImageProviderProfile.DEFAULT_MODELS_PATH },
+            size = size.trim(),
+            quality = quality.trim(),
+            style = style.trim(),
+            responseFormat = responseFormat.trim(),
+            sendNegativePrompt = sendNegativePrompt,
+            extraBody = extra,
+        )
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(stringResource(
+                if (initial == null) R.string.setimg_profile_add else R.string.setimg_profile_edit,
+            ))
+        },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text(stringResource(R.string.setimg_profile_name)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    isError = nameError,
+                    supportingText = { if (nameError) Text(stringResource(R.string.setimg_profile_required)) },
+                )
+                OutlinedTextField(
+                    value = baseUrl,
+                    onValueChange = { baseUrl = it },
+                    label = { Text(stringResource(R.string.setimg_profile_baseurl)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    placeholder = { Text("https://api.example.com") },
+                    isError = baseUrlError,
+                    supportingText = { if (baseUrlError) Text(stringResource(R.string.setimg_profile_required)) },
+                )
+                OutlinedTextField(
+                    value = apiKey,
+                    onValueChange = { apiKey = it },
+                    label = { Text(stringResource(R.string.setimg_profile_apikey)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    visualTransformation = if (apiKeyVisible) VisualTransformation.None
+                    else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(onClick = { apiKeyVisible = !apiKeyVisible }) {
+                            Icon(
+                                if (apiKeyVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                contentDescription = null,
+                            )
+                        }
+                    },
+                )
+                OutlinedTextField(
+                    value = model,
+                    onValueChange = { model = it },
+                    label = { Text(stringResource(R.string.setimg_profile_model)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    placeholder = { Text("dall-e-3") },
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = path,
+                        onValueChange = { path = it },
+                        label = { Text(stringResource(R.string.setimg_profile_path)) },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                    )
+                    OutlinedTextField(
+                        value = modelsPath,
+                        onValueChange = { modelsPath = it },
+                        label = { Text(stringResource(R.string.setimg_profile_models_path)) },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = size,
+                        onValueChange = { size = it },
+                        label = { Text(stringResource(R.string.setimg_profile_size)) },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                    )
+                    OutlinedTextField(
+                        value = quality,
+                        onValueChange = { quality = it },
+                        label = { Text(stringResource(R.string.setimg_profile_quality)) },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = style,
+                        onValueChange = { style = it },
+                        label = { Text(stringResource(R.string.setimg_profile_style)) },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                    )
+                    OutlinedTextField(
+                        value = responseFormat,
+                        onValueChange = { responseFormat = it },
+                        label = { Text(stringResource(R.string.setimg_profile_response_format)) },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                        placeholder = { Text("url / b64_json") },
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(stringResource(R.string.setimg_profile_send_negative), modifier = Modifier.weight(1f))
+                    Switch(checked = sendNegativePrompt, onCheckedChange = { sendNegativePrompt = it })
+                }
+                OutlinedTextField(
+                    value = extraBody,
+                    onValueChange = {
+                        extraBody = it
+                        extraBodyError = false
+                    },
+                    label = { Text(stringResource(R.string.setimg_profile_extra_body)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                    isError = extraBodyError,
+                    supportingText = {
+                        Text(
+                            stringResource(
+                                if (extraBodyError) R.string.setimg_profile_extra_body_invalid
+                                else R.string.setimg_profile_extra_body_help,
+                            ),
+                        )
+                    },
+                )
+                if (testStatus != null) {
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (testStatus.available) MaterialTheme.colorScheme.primaryContainer
+                            else MaterialTheme.colorScheme.errorContainer,
+                        ),
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Text(
+                                text = if (testStatus.available) stringResource(R.string.setimg_status_connected)
+                                else stringResource(R.string.setimg_status_failed),
+                                style = MaterialTheme.typography.titleSmall,
+                                color = if (testStatus.available) MaterialTheme.colorScheme.onPrimaryContainer
+                                else MaterialTheme.colorScheme.onErrorContainer,
+                            )
+                            Text(
+                                text = testStatus.message,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (testStatus.available) MaterialTheme.colorScheme.onPrimaryContainer
+                                else MaterialTheme.colorScheme.onErrorContainer,
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Row {
+                TextButton(
+                    onClick = {
+                        buildProfile()?.let(onTest) ?: run { extraBodyError = true }
+                    },
+                    enabled = !isTesting,
+                ) {
+                    if (isTesting) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Spacer(modifier = Modifier.width(8.dp))
+                    }
+                    Text(stringResource(R.string.setimg_test_connection))
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                TextButton(
+                    onClick = {
+                        showValidation = true
+                        val profile = buildProfile()
+                        if (profile != null && name.isNotBlank() && baseUrl.isNotBlank()) {
+                            onSave(profile)
+                        } else if (profile == null) {
+                            extraBodyError = true
+                        }
+                    },
+                ) {
+                    Text(stringResource(R.string.setimg_save))
+                }
             }
         },
         dismissButton = {

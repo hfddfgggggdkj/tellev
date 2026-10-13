@@ -5,10 +5,14 @@ import app.tellev.core.i18n.UiStrings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.decodeFromStream
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
+import java.nio.file.AccessDeniedException
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
+import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 
@@ -36,24 +40,28 @@ class CreationRepository(private val root: File) {
     @Serializable
     private class CountOnlyDto
 
+    @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
     suspend fun list(): List<CreationSessionSummary> = withContext(Dispatchers.IO) {
         root.listFiles { file -> file.isFile && file.name.endsWith(".json") }
             ?.mapNotNull { file ->
-                // ignoreUnknownKeys makes unknown fields (including whole lore
-                // bodies and merge bases) stream past without being retained.
+                // O12: decode from the stream so unknown fields (including
+                // whole lore bodies and merge bases) are skipped token-wise
+                // instead of materializing a multi-MB String per draft.
                 runCatching {
-                    val dto = json.decodeFromString<SessionSummaryDto>(file.readText())
-                    CreationSessionSummary(
-                        id = dto.id.ifBlank { file.nameWithoutExtension },
-                        kind = dto.kind,
-                        cardName = dto.card.name,
-                        worldName = dto.worldName,
-                        turnsCount = dto.turns.size,
-                        loreCount = dto.lore.size,
-                        sourceCursor = dto.sourceCursor,
-                        sourceLength = dto.sourceLength,
-                        updatedAt = dto.updatedAt,
-                    )
+                    file.inputStream().use { input ->
+                        val dto = json.decodeFromStream<SessionSummaryDto>(input)
+                        CreationSessionSummary(
+                            id = dto.id.ifBlank { file.nameWithoutExtension },
+                            kind = dto.kind,
+                            cardName = dto.card.name,
+                            worldName = dto.worldName,
+                            turnsCount = dto.turns.size,
+                            loreCount = dto.lore.size,
+                            sourceCursor = dto.sourceCursor,
+                            sourceLength = dto.sourceLength,
+                            updatedAt = dto.updatedAt,
+                        )
+                    }
                 }.getOrNull()
             }
             ?.sortedByDescending(CreationSessionSummary::updatedAt).orEmpty()
@@ -68,14 +76,7 @@ class CreationRepository(private val root: File) {
         val destination = sessionFile(session.id)
         val temporary = File(root, "${safeId(session.id)}.json.tmp")
         temporary.writeText(json.encodeToString(session))
-        try {
-            Files.move(
-                temporary.toPath(), destination.toPath(),
-                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE,
-            )
-        } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
-            Files.move(temporary.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING)
-        }
+        moveReplacing(temporary.toPath(), destination.toPath())
     }
 
     suspend fun saveSource(id: String, text: String): Pair<String, Int> =
@@ -83,7 +84,14 @@ class CreationRepository(private val root: File) {
             root.mkdirs()
             val bytes = text.toByteArray(Charsets.UTF_8)
             val hash = sha256(bytes)
-            sourceFile(id, hash).writeBytes(bytes)
+            val destination = sourceFile(id, hash)
+            // Same tmp+ATOMIC_MOVE discipline as save()/saveCover(): a crash
+            // mid-write must not leave a truncated source file behind.
+            if (!destination.isFile) {
+                val temporary = File(root, "${safeId(id)}.$hash.source.tmp")
+                temporary.writeBytes(bytes)
+                moveReplacing(temporary.toPath(), destination.toPath())
+            }
             hash to text.length
         }
 
@@ -97,11 +105,7 @@ class CreationRepository(private val root: File) {
         if (!destination.isFile) {
             val temporary = File(root, "${safeId(id)}.$hash.cover.png.tmp")
             temporary.writeBytes(pngBytes)
-            try {
-                Files.move(temporary.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE)
-            } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
-                Files.move(temporary.toPath(), destination.toPath())
-            }
+            moveReplacing(temporary.toPath(), destination.toPath(), replace = false)
         }
         hash
     }
@@ -132,6 +136,37 @@ class CreationRepository(private val root: File) {
     }
 
     private fun sessionFile(id: String): File = File(root, "${safeId(id)}.json")
+
+    /**
+     * tmp+ATOMIC_MOVE rename with a short retry on Windows access-denied:
+     * a concurrent reader (draft list streaming, thumbnail scan) briefly holds
+     * the destination open and makes REPLACE_EXISTING fail — transient, not a
+     * caller error. Retrying a few times keeps the checkpoint write from
+     * falsely marking the turn failed; genuine contention still throws.
+     */
+    private fun moveReplacing(temporary: Path, destination: Path, replace: Boolean = true) {
+        val options = if (replace) {
+            arrayOf(StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        } else {
+            arrayOf(StandardCopyOption.ATOMIC_MOVE)
+        }
+        var attempts = 0
+        while (true) {
+            attempts++
+            try {
+                try {
+                    Files.move(temporary, destination, *options)
+                } catch (_: AtomicMoveNotSupportedException) {
+                    Files.move(temporary, destination, *(if (replace) arrayOf(StandardCopyOption.REPLACE_EXISTING) else emptyArray()))
+                }
+                return
+            } catch (denied: AccessDeniedException) {
+                if (attempts >= 5) throw denied
+                Thread.sleep(20L * attempts)
+            }
+        }
+    }
+
     private fun coverFile(id: String, sha256: String): File {
         require(Regex("[a-f0-9]{64}").matches(sha256)) { "Invalid cover digest" }
         return File(root, "${safeId(id)}.$sha256.cover.png")

@@ -28,23 +28,23 @@ class AppPreferences(
         set(value) = prefs.edit().putBoolean(KEY_AUTO_UPDATE_CHECK, value).apply()
 
     /**
+     * Whether cleartext HTTP to non-loopback hosts (e.g. a LAN ComfyUI at
+     * http://192.168.x.x:8188) is allowed. Loopback (localhost/127.0.0.1) is
+     * always allowed. Defaults to false so remote requests must use HTTPS;
+     * enforced by [app.tellev.core.network.CleartextGuard] on every client.
+     */
+    var allowRemoteCleartext: Boolean
+        get() = prefs.getBoolean(KEY_ALLOW_REMOTE_CLEARTEXT, DEFAULT_ALLOW_REMOTE_CLEARTEXT)
+        set(value) = prefs.edit().putBoolean(KEY_ALLOW_REMOTE_CLEARTEXT, value).apply()
+
+    /**
      * Theme preference stored as the enum name so the storage layer stays
      * independent of the UI-layer ThemeMode type; callers parse with
-     * [app.tellev.ui.theme.parseThemeMode].
+     * [app.tellev.ui.dsh.parseThemeMode].
      */
     var themeModeName: String
         get() = prefs.getString(KEY_THEME_MODE, DEFAULT_THEME_MODE) ?: DEFAULT_THEME_MODE
         set(value) = prefs.edit().putString(KEY_THEME_MODE, value).apply()
-
-    /**
-     * Accent palette preference stored as the enum name so the storage layer
-     * stays independent of the UI-layer ThemeAccent type; callers parse with
-     * [app.tellev.ui.theme.parseThemeAccent]. Defaults to the Warm palette so
-     * existing installs (which have no stored value) pick up the new look.
-     */
-    var themeAccentName: String
-        get() = prefs.getString(KEY_THEME_ACCENT, DEFAULT_THEME_ACCENT) ?: DEFAULT_THEME_ACCENT
-        set(value) = prefs.edit().putString(KEY_THEME_ACCENT, value).apply()
 
     /**
      * Chat bubble opacity (1 = opaque, 0 = fully transparent). Stored as a
@@ -131,12 +131,12 @@ class AppPreferences(
     private companion object {
         const val KEY_LAST_CHECK = "last_update_check_ms"
         const val KEY_AUTO_UPDATE_CHECK = "auto_update_check"
+        const val KEY_ALLOW_REMOTE_CLEARTEXT = "allow_remote_cleartext"
         const val KEY_PRESET_LIMIT_NOTICE_HANDLED = "preset_limits_1_5_1_notice_handled"
         const val KEY_QQ_GROUP_NOTICE_HANDLED = "qq_group_notice_handled"
         const val KEY_UPDATE_GUIDE_VERSION = "update_guide_shown_version"
         const val KEY_ONBOARDING_SHOWN = "onboarding_guide_shown"
         const val KEY_THEME_MODE = "theme_mode"
-        const val KEY_THEME_ACCENT = "theme_accent"
         const val KEY_CHAT_BUBBLE_ALPHA = "chat_bubble_alpha"
         const val KEY_CHAT_FONT_SIZE = "chat_font_size_sp"
         const val KEY_LANGUAGE_TAG = "language_tag"
@@ -144,13 +144,12 @@ class AppPreferences(
         /** Defaults to on so an upgrade keeps the previous launch-check behaviour. */
         const val DEFAULT_AUTO_UPDATE_CHECK = true
 
+        /** Cleartext HTTP off by default: remote requests must use HTTPS. */
+        const val DEFAULT_ALLOW_REMOTE_CLEARTEXT = false
+
         /** Literal "System" — the ThemeMode.System enum name, kept as a
          *  string so this layer does not depend on the UI enum. */
         const val DEFAULT_THEME_MODE = "System"
-
-        /** Literal "Warm" — the ThemeAccent.Warm enum name; same rationale as
-         *  [DEFAULT_THEME_MODE]. */
-        const val DEFAULT_THEME_ACCENT = "Warm"
 
         /** Legacy hardcoded bubble alpha in ChatScreen; keep as default so
          *  existing installs see no visual change. */
